@@ -1,0 +1,8 @@
+.seen_jobs.json
+__pycache__/
+*.pyc
+*.pyo
+.env
+.DS_Store
+config.py
+profile.md

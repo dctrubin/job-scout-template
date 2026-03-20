@@ -1,0 +1,48 @@
+name: Job Scout
+
+on:
+  schedule:
+    - cron: '45 9 * * *'    # ~4:45am CDT (3:45am CST)
+    - cron: '52 21 * * *'   # ~3:52pm CST (4:52pm CDT)
+  workflow_dispatch:        # allow manual runs from the Actions tab
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-job-scout-v1
+
+      - name: Install dependencies
+        run: pip install requests anthropic beautifulsoup4 lxml
+
+      - name: Restore seen jobs cache
+        uses: actions/cache@v4
+        with:
+          path: .seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
+          restore-keys: |
+            seen-jobs-
+
+      - name: Run Job Scout
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          NOTION_COMPANIES_DB_ID: ${{ secrets.NOTION_COMPANIES_DB_ID }}
+        run: python job_scout.py
