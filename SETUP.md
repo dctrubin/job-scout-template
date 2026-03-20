@@ -30,16 +30,16 @@ Create all five accounts before starting the setup steps — it's faster than sw
 
 ---
 
-## Step 1: Fork the repo to your GitHub account
-
-"Forking" makes a personal copy of this code that lives in your GitHub account. You'll run the automation from your copy.
+## Step 1: Create your own private copy of the repo
 
 1. Make sure you're logged into GitHub
-2. Go to [github.com/dctrubin/job-scout](https://github.com/dctrubin/job-scout)
-3. Click the **Fork** button in the top-right corner
-4. On the fork screen, leave everything as-is and click **Create fork**
-5. You'll land on your own copy at `github.com/YOUR-USERNAME/job-scout`
-6. Click **Settings** (top nav of your repo) → scroll down to **Danger Zone** → click **Change visibility** → set to **Private** → confirm
+2. Go to [github.com/dctrubin/job-scout-template](https://github.com/dctrubin/job-scout-template)
+3. Click the green **Use this template** button → **Create a new repository**
+4. Name it whatever you like (e.g. `job-scout`)
+5. Set visibility to **Private**
+6. Click **Create repository**
+
+You'll land on your own copy at `github.com/YOUR-USERNAME/job-scout`. This is where you'll work for the rest of setup.
 
 **Why private?** In the next steps you'll add your resume and personal details to a file called `profile.md`. A private repo keeps that information visible only to you.
 
