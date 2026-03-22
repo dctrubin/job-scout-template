@@ -9,6 +9,7 @@ on:
 jobs:
   scout:
     runs-on: ubuntu-latest
+    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
 
     steps:
       - name: Check out repo
