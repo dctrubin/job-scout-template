@@ -64,7 +64,7 @@ Click both links below. Each one will open in Notion and show a **Duplicate** bu
 1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations)
 2. Click **New integration**
 3. Name it **Job Scout**, leave all other settings as-is, click **Save**
-4. You'll see an **Internal Integration Secret** — it starts with `secret_`. **Copy this and save it somewhere** — you'll need it in Step 6.
+4. You'll see an **Internal Integration Secret** — it starts with `ntn_`. **Copy this and save it somewhere** — you'll need it in Step 6.
 
 ### 2c. Connect the integration to your databases
 
@@ -103,7 +103,7 @@ An API key is like a password that lets the code access each service on your beh
 
 ### Notion API key (for reading/writing your databases)
 
-You already created this in Step 2b. It starts with `secret_`. Find it again at [notion.so/my-integrations](https://www.notion.so/my-integrations) → click your Job Scout integration.
+You already created this in Step 2b. It starts with `ntn_`. Find it again at [notion.so/my-integrations](https://www.notion.so/my-integrations) → click your Job Scout integration.
 
 ### Serper API key (for searching Google)
 
@@ -192,7 +192,7 @@ GitHub Actions (the automation that runs your code) needs your API keys to do it
 | Secret name (type exactly as shown) | Value | Where you got it |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | `sk-ant-...` | Step 3 — Anthropic |
-| `NOTION_API_KEY` | `secret_...` | Step 2b — Notion integration |
+| `NOTION_API_KEY` | `ntn_...` | Step 2b — Notion integration |
 | `NOTION_DATABASE_ID` | long ID string | Step 2d — Jobs DB ID |
 | `NOTION_COMPANIES_DB_ID` | long ID string | Step 2d — Companies DB ID |
 | `SERPER_API_KEY` | your key | Step 3 — Serper.dev dashboard |
