@@ -54,10 +54,10 @@ Notion is where your scored jobs will appear. You'll duplicate a pre-built templ
 Click both links below. Each one will open in Notion and show a **Duplicate** button in the top-right corner. Click it to add the database to your workspace.
 
 - **Jobs database** (where scored jobs land):
-  https://dust-holiday-2a3.notion.site/329964e0b7f48056b449d79f06680415?v=329964e0b7f48111bfe5000c76ce9b96&source=copy_link
+  https://dust-holiday-2a3.notion.site/329964e0b7f480748684d11ec9f1dde8?v=329964e0b7f48124bd1f000c7dc2cc4c&source=copy_link
 
 - **Companies database** (optional — add specific companies to watch or boost):
-  https://dust-holiday-2a3.notion.site/329964e0b7f480748684d11ec9f1dde8?v=329964e0b7f48124bd1f000c7dc2cc4c&source=copy_link
+  https://dust-holiday-2a3.notion.site/329964e0b7f48056b449d79f06680415?v=329964e0b7f48111bfe5000c76ce9b96&source=copy_link
 
 ### 2b. Create a Notion integration (connects the code to your databases)
 
