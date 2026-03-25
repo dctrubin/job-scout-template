@@ -49,10 +49,9 @@ from config import (
 )
 
 _profile_path = pathlib.Path(__file__).parent / "profile.md"
-  if not _profile_path.exists():                                                                                                                         
+if not _profile_path.exists():                                                                                                                         
       print("Setup required: profile.md not found. Copy profile.example.md to profile.md and fill in your details.")
       raise SystemExit(0)
-    )
 CANDIDATE_PROFILE = _profile_path.read_text()
 
 _DIR           = os.path.dirname(os.path.abspath(__file__))
