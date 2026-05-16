@@ -23,26 +23,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-job-scout-v1
+          key: pip-job-scout-v2
 
       - name: Install dependencies
-        run: pip install requests anthropic beautifulsoup4 lxml
+        run: pip install -r requirements.txt
 
-      - name: Restore seen jobs cache
-        uses: actions/cache@v4
-        with:
-          path: .seen_jobs.json
-          key: seen-jobs-${{ github.run_id }}
-          restore-keys: |
-            seen-jobs-
+      - name: Write candidate profile
+        env:
+          CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
+        run: echo "$CANDIDATE_PROFILE" > profile.md
 
       - name: Run Job Scout
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
-          NOTION_COMPANIES_DB_ID: ${{ secrets.NOTION_COMPANIES_DB_ID }}
-        run: python job_scout.py
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python3 job_scout.py

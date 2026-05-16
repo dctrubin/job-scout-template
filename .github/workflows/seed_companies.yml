@@ -1,0 +1,32 @@
+name: Seed Companies
+
+on:
+  workflow_dispatch:    # manual trigger only — run this once during setup
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-job-scout-v2
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Seed companies into Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python3 seed_companies.py

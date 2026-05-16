@@ -8,31 +8,18 @@
 
 # ─── TUNING ───────────────────────────────────────────────────────────────────
 
-HOURS_LOOKBACK      = 48   # how far back to look for jobs (48 accounts for Google indexing lag)
+HOURS_LOOKBACK      = 48   # how far back to look for jobs — used to limit scope on first run
 SCORE_THRESHOLD     = 60   # min score (0–100) to push to Notion — start here, raise if too noisy
 CONTACT_SCORE_BOOST = 10   # bonus points for companies where Has Contact = true in Notion
 WATCH_SCORE_BOOST   = 5    # bonus for Priority=Watch companies in Notion companies DB
 HIGH_SCORE_BOOST    = 10   # bonus for Priority=High companies in Notion companies DB
-SERPER_RESULTS      = 20   # results per Serper query (20 is the free tier max)
 
-# ─── PLATFORMS ────────────────────────────────────────────────────────────────
+# ─── ROLE TITLES ──────────────────────────────────────────────────────────────
 #
-# Which ATS platforms to search. Comment out any you want to skip.
-# Rippling and Workday are lower-reliability — safe to remove if you want fewer runs.
-
-PLATFORMS = [
-    "greenhouse",   # very reliable, large coverage
-    "ashby",        # very reliable, fast-growing startups
-    "lever",        # very reliable
-    "rippling",     # may be blocked intermittently by Cloudflare
-    "workday",      # JS-rendered pages — job skipped if description unavailable
-]
-
-# ─── ROLE TITLES (Serper search queries) ──────────────────────────────────────
-#
-# One Serper query is fired per title × per platform × per run.
-# Free tier: 2,500 queries/month. Math: 8 titles × 5 platforms × 2 runs/day × 30 days = 2,400.
-# Keep to ~8 titles max. Remove one before adding one.
+# Title keywords to match against job postings. Jobs pass the title filter if:
+#   - The title contains any of these strings (case-insensitive), OR
+#   - The title contains an ops/systems word AND a GTM domain qualifier (see below)
+# No limit on the number of titles — no search API is used.
 
 ROLE_TITLES = [
     "Your Role Title",

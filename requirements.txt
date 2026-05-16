@@ -2,3 +2,5 @@ requests
 anthropic
 beautifulsoup4
 lxml
+supabase
+rapidfuzz

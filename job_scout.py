@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Job Scout - Search-based job discovery and AI scoring for Dakota Rubin
+Job Scout — Direct ATS polling and AI scoring for Dakota Rubin
 
 Discovery flow:
-  1. Search Google (via Serper) for each ATS platform using role-title keywords
-  2. Parse job URLs → extract company slug + job ID
-  3. Fetch full job details from each platform's API (or scrape HTML for Rippling)
-  4. Filter → score with Claude → push to Notion
+  1. Load all companies from Supabase (38k companies, VIP flags included)
+  2. Poll each company's ATS API in parallel for all open jobs
+  3. Filter by title → check seen cache → hard filters
+  4. Score new matches with Claude → push to Notion → Pushover alert (Tier A)
 
-No company list required. Covers Greenhouse, Ashby, Rippling, Lever automatically.
-Workable and Breezy are available as per-company opt-ins via companies.json.
+Covers Greenhouse, Lever, Ashby, Workable, BambooHR, Breezy.
+No search API required. Operational data (seen jobs, dead slugs) persists in Supabase.
 """
 
 import os
@@ -18,114 +18,64 @@ import time
 import logging
 import re
 import argparse
-from collections import defaultdict
+import pathlib
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List, Dict, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
 from anthropic import Anthropic
+from supabase import create_client, Client
+from rapidfuzz import fuzz, process as rfuzz_process
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY       = os.environ.get("ANTHROPIC_API_KEY", "")
-NOTION_API_KEY          = os.environ.get("NOTION_API_KEY", "")
-NOTION_DATABASE_ID      = os.environ.get("NOTION_DATABASE_ID", "")
-NOTION_COMPANIES_DB_ID  = os.environ.get("NOTION_COMPANIES_DB_ID", "")
-SERPER_API_KEY          = os.environ.get("SERPER_API_KEY", "")
-PUSHOVER_USER_KEY       = os.environ.get("PUSHOVER_USER_KEY", "")
-PUSHOVER_APP_TOKEN      = os.environ.get("PUSHOVER_APP_TOKEN", "")
-
-import pathlib
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+NOTION_API_KEY     = os.environ.get("NOTION_API_KEY", "")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
+PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "")
+PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "")
+SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY       = os.environ.get("SUPABASE_KEY", "")
 
 from config import (
     HOURS_LOOKBACK, SCORE_THRESHOLD, CONTACT_SCORE_BOOST,
-    WATCH_SCORE_BOOST, HIGH_SCORE_BOOST, SERPER_RESULTS,
+    WATCH_SCORE_BOOST, HIGH_SCORE_BOOST,
     ROLE_TITLES, _OPS_TERMS, _DOMAIN_QUALS,
-    HARD_FILTERS, SCORING_RULES, PLATFORMS as _ENABLED_PLATFORMS,
+    HARD_FILTERS, SCORING_RULES,
 )
 
 _profile_path = pathlib.Path(__file__).parent / "profile.md"
-if not _profile_path.exists():                                                                                                                         
-      print("Setup required: profile.md not found. Copy profile.example.md to profile.md and fill in your details.")
-      raise SystemExit(0)
+if not _profile_path.exists():
+    print("Setup required: profile.md not found. Copy profile.example.md to profile.md and fill in your details.")
+    raise SystemExit(0)
 CANDIDATE_PROFILE = _profile_path.read_text()
 
-_DIR           = os.path.dirname(os.path.abspath(__file__))
-SEEN_JOBS_FILE = os.path.join(_DIR, ".seen_jobs.json")
+_DIR            = os.path.dirname(os.path.abspath(__file__))
+SEEN_JOBS_FILE  = os.path.join(_DIR, ".seen_jobs.json")   # fallback if Supabase not configured
+DEAD_SLUGS_FILE = os.path.join(_DIR, ".dead_slugs.json")  # fallback if Supabase not configured
 
-# ─── PLATFORM DEFINITIONS ─────────────────────────────────────────────────────
-#
-# Each entry drives:
-#   - The `site:` prefix for the Google search
-#   - A regex that parses (company_slug, job_id) from a matching URL
-#   - A regex that extracts a human-readable company name from the search result title
-#
-# Priority order: Greenhouse → Ashby → Rippling → Lever
+# Parallel polling worker counts per platform
+PLATFORM_WORKERS: Dict[str, int] = {
+    "greenhouse": 10,
+    "lever":      10,
+    "ashby":       5,
+    "bamboohr":    8,
+    "workable":    8,
+    "breezy":      5,
+}
 
-_PLATFORM_DEFS = [
-    {
-        "name": "greenhouse",
-        "site": "boards.greenhouse.io",
-        # https://boards.greenhouse.io/{slug}/jobs/{numeric-id}
-        "url_re": re.compile(
-            r"boards\.greenhouse\.io/([^/?#]+)/jobs/(\d+)", re.I
-        ),
-        # "Job Application for VP of RevOps at Stripe"
-        "title_re": re.compile(r"Job Application for .+ at (.+)$", re.I),
-    },
-    {
-        "name": "ashby",
-        "site": "jobs.ashbyhq.com",
-        # https://jobs.ashbyhq.com/{slug}/{uuid}
-        "url_re": re.compile(
-            r"jobs\.ashbyhq\.com/([^/?#]+)/([0-9a-f]{8}-[0-9a-f\-]{27,35})", re.I
-        ),
-        # "Revenue Operations Manager @ Runway Financial - Jobs"
-        "title_re": re.compile(r".+ @ (.+?)(?:\s+-\s+(?:Jobs?|Careers?))?$", re.I),
-    },
-    {
-        "name": "rippling",
-        "site": "ats.rippling.com",
-        # https://ats.rippling.com/{slug}/jobs/{uuid}
-        # https://ats.rippling.com/en-US/{slug}/jobs/{uuid}  (locale prefix variant)
-        "url_re": re.compile(
-            r"ats\.rippling\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/?#]+)/jobs/([0-9a-f]{8}-[0-9a-f\-]{27,35})",
-            re.I,
-        ),
-        # "Director, Revenue Operations | PDQ Careers"
-        "title_re": re.compile(r"\|\s+(.+?)(?:\s+(?:Careers?|Jobs?|Career\s+Site|Current\s+Openings?|Job\s+[Oo]penings?))?\s*$", re.I),
-    },
-    {
-        "name": "lever",
-        "site": "jobs.lever.co",
-        # https://jobs.lever.co/{slug}/{uuid}
-        "url_re": re.compile(
-            r"jobs\.lever\.co/([^/?#]+)/([0-9a-f]{8}-[0-9a-f\-]{27,35})", re.I
-        ),
-        # "Stripe - Director of Revenue Operations"
-        "title_re": re.compile(r"^(.+?)\s+-\s+.+$", re.I),
-    },
-    {
-        "name": "workday",
-        "site": "myworkdayjobs.com",
-        # https://{company}.wd1.myworkdayjobs.com/External/job/Remote/Director-RevOps_R-123
-        "url_re": re.compile(
-            r"([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com/(?:[^/]+/)*job/[^/]+/([^/?#]+)", re.I
-        ),
-        # Company name comes reliably from the subdomain slug — no title_re needed
-    },
-]
+# ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
 
-# Filter to only the platforms enabled in config.py
-_enabled_set = set(_ENABLED_PLATFORMS)
-PLATFORMS = [p for p in _PLATFORM_DEFS if p["name"] in _enabled_set]
-
-# These Rippling title fragments are generic (not company names)
-_RIPPLING_GENERIC = {"current openings", "job openings", "careers", "jobs", "career site", "openings"}
+def _get_supabase() -> Optional[Client]:
+    """Return Supabase client if credentials are configured, else None."""
+    if SUPABASE_URL and SUPABASE_KEY:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    return None
 
 # ─── UTILITIES ────────────────────────────────────────────────────────────────
 
@@ -158,189 +108,207 @@ def parse_iso_date(s: str) -> Optional[datetime]:
 def slug_to_name(slug: str) -> str:
     return slug.replace("-", " ").replace("_", " ").title()
 
-# ─── COMPANIES  (Notion DB preferred, companies.json fallback) ────────────────
 
-def load_companies_from_notion() -> list[dict]:
-    """Read companies from the Notion companies database."""
-    headers = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
-    }
+_NORM_PUNCT     = re.compile(r"[^a-z0-9\s]")
+_NORM_SPACES    = re.compile(r"\s+")
+_NORM_SUFFIXES  = re.compile(
+    r"\b(inc|llc|llp|ltd|corp|corporation|co|company|group|holdings|"
+    r"international|worldwide|global|technologies|technology|tech|"
+    r"solutions|services|consulting|partners|associates|ventures)\b",
+    re.IGNORECASE,
+)
+
+def normalize_company(name: str) -> str:
+    """Lowercase, strip legal suffixes and punctuation, collapse whitespace."""
+    name = name.lower()
+    name = _NORM_SUFFIXES.sub("", name)
+    name = _NORM_PUNCT.sub(" ", name)
+    name = _NORM_SPACES.sub(" ", name).strip()
+    return name
+
+
+# ─── COMPANIES (Supabase) ─────────────────────────────────────────────────────
+
+def load_companies_from_supabase(sb: Client) -> list:
+    """
+    Load all companies from Supabase. Returns list of company dicts with
+    the same shape used throughout the rest of the script.
+    Paginates 1000 rows at a time (Supabase default max).
+    """
     companies = []
-    cursor = None
+    offset    = 0
+    page_size = 1000
+
     while True:
-        body = {"page_size": 100}
-        if cursor:
-            body["start_cursor"] = cursor
         try:
-            resp = requests.post(
-                f"https://api.notion.com/v1/databases/{NOTION_COMPANIES_DB_ID}/query",
-                headers=headers,
-                json=body,
-                timeout=15,
+            result = (
+                sb.table("companies")
+                .select("slug, ats")
+                .range(offset, offset + page_size - 1)
+                .execute()
             )
-            resp.raise_for_status()
-            data = resp.json()
         except Exception as e:
-            logger.error(f"Failed to load companies from Notion: {e}")
+            logger.error(f"Failed to load companies from Supabase: {e}")
             return []
 
-        for page in data.get("results", []):
-            props = page.get("properties", {})
-
-            def txt(key):
-                p = props.get(key, {})
-                items = p.get("rich_text") or p.get("title") or []
-                return items[0]["plain_text"].strip() if items else ""
-
-            def chk(key):
-                return props.get(key, {}).get("checkbox", False)
-
-            def sel(key):
-                s = props.get(key, {}).get("select") or {}
-                return s.get("name", "")
-
-            def url_val(key):
-                return props.get(key, {}).get("url") or ""
-
-            slug     = txt("Slug")
-            ats      = sel("ATS").lower()
-            priority = sel("Priority")   # "Normal", "Watch", "High"
-
-            if not slug and not url_val("Job Board URL"):
-                continue  # nothing actionable
-
+        rows = result.data or []
+        for row in rows:
+            slug = (row.get("slug") or "").strip()
+            ats  = (row.get("ats")  or "").strip().lower()
+            if not slug or not ats:
+                continue
             companies.append({
-                "slug":          slug,
-                "ats":           ats,
-                "name":          txt("Name"),
-                "has_contact":   chk("Has Contact"),
-                "priority":      priority,
-                "job_board_url": url_val("Job Board URL"),
-                "contact_name":  txt("Contact Name"),
-                "contact_role":  txt("Contact Role"),
-                "relationship":  txt("Relationship"),
-                "notes":         txt("Notes"),
+                "slug": slug,
+                "ats":  ats,
+                "name": slug.replace("-", " ").replace("_", " ").title(),
             })
 
-        if not data.get("has_more"):
+        if len(rows) < page_size:
             break
-        cursor = data.get("next_cursor")
+        offset += page_size
 
-    logger.info(f"Loaded {len(companies)} companies from Notion")
+    logger.info(f"Loaded {len(companies)} companies from Supabase")
     return companies
 
 
-def load_companies() -> list[dict]:
-    """Load companies from the Notion companies database."""
-    if not (NOTION_COMPANIES_DB_ID and NOTION_API_KEY):
-        logger.warning("NOTION_COMPANIES_DB_ID not set — no company boosts or watch list")
+def load_companies() -> list:
+    sb = _get_supabase()
+    if not sb:
+        logger.error("SUPABASE_URL and SUPABASE_KEY must be set — cannot load companies")
         return []
-    return load_companies_from_notion()
+    return load_companies_from_supabase(sb)
 
-# ─── SERPER SEARCH ────────────────────────────────────────────────────────────
 
-def search_platform(platform: dict) -> list[dict]:
+def load_watchlist(sb: Client) -> Dict[Tuple[str, str], dict]:
     """
-    Search Google (via Serper) for jobs on one ATS platform.
-    Runs one query per role title and merges results (up to 70 per platform).
-    Returns deduplicated raw Serper organic results.
+    Load company_watchlist from Supabase.
+    Returns dict keyed by (slug, ats) → {'priority': 'watch'|'high', 'notes': str}.
     """
-    if not SERPER_API_KEY:
-        logger.error("SERPER_API_KEY not set — cannot run search-based discovery")
-        return []
+    try:
+        result = sb.table("company_watchlist").select("slug, ats, priority, notes").execute()
+        return {
+            (row["slug"], row["ats"]): {
+                "priority": (row.get("priority") or "watch").lower(),
+                "notes":    row.get("notes") or "",
+            }
+            for row in (result.data or [])
+        }
+    except Exception as e:
+        logger.warning(f"Failed to load watchlist from Supabase: {e}")
+        return {}
 
-    logger.info(f"Searching {platform['name']} ({len(ROLE_TITLES)} title queries)...")
 
-    all_results: list[dict] = []
-    seen_links: set[str]   = set()
+# Minimum fuzzy score to consider a contacts match valid.
+_CONTACT_MATCH_THRESHOLD = 85
 
-    for title in ROLE_TITLES:
-        query = f'site:{platform["site"]} "{title}"'
-        try:
-            resp = requests.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": query, "num": SERPER_RESULTS},
-                timeout=15,
+def load_contacts_index(sb: Client) -> Tuple[List[str], List[dict]]:
+    """
+    Load all contacts from Supabase for job-first fuzzy matching.
+    Returns (norm_names, contact_rows) — norm_names[i] corresponds to contact_rows[i].
+    At scoring time, match job.company_name against norm_names to find a connection.
+    """
+    try:
+        result = sb.table("contacts").select(
+            "id, slug, ats, linkedin_company, contact_name, contact_role, linkedin_url"
+        ).execute()
+        rows = result.data or []
+        norm_names = [normalize_company(row.get("linkedin_company") or "") for row in rows]
+        return norm_names, rows
+    except Exception as e:
+        logger.warning(f"Failed to load contacts index from Supabase: {e}")
+        return [], []
+
+
+def find_contacts(
+    company_name: str,
+    contact_norm_names: List[str],
+    contact_rows: List[dict],
+    slug: str = "",
+    ats: str = "",
+) -> List[dict]:
+    """
+    Return ALL contacts that match this job's company, via two strategies:
+
+    1. Fuzzy name match: normalize job.company_name → match against contacts.linkedin_company.
+       Catches the common case where the ATS returns a canonical company name (Greenhouse,
+       Lever, Ashby all do this well). BambooHR falls back to slug_to_name() which is often
+       good enough after normalization strips legal suffixes.
+
+    2. Slug/ATS match: find contacts where contacts.slug == job.slug AND contacts.ats == job.ats.
+       Catches contacts that were imported via the old slug-matching flow (linkedin_write.py),
+       covering abbreviation slugs like 'ghx' or 'iqvia' that fuzzy name matching would miss.
+
+    Results are deduplicated by contact id. Returns [] if no contacts found.
+    """
+    matched: Dict[str, dict] = {}  # keyed by contact id to deduplicate
+
+    # Strategy 1: fuzzy company name match
+    if company_name and contact_norm_names:
+        norm = normalize_company(company_name)
+        if norm:
+            results = rfuzz_process.extract(
+                norm, contact_norm_names, scorer=fuzz.token_sort_ratio, score_cutoff=_CONTACT_MATCH_THRESHOLD
             )
-            resp.raise_for_status()
-            for r in resp.json().get("organic", []):
-                link = r.get("link", "")
-                if link and link not in seen_links:
-                    seen_links.add(link)
-                    all_results.append(r)
-            time.sleep(0.5)   # be polite between Serper calls
-        except requests.HTTPError as e:
-            body = e.response.text if e.response is not None else ""
-            logger.error(f"Serper error ({platform['name']}, '{title}'): {e} — {body}")
-        except Exception as e:
-            logger.error(f"Serper error ({platform['name']}, '{title}'): {e}")
+            for _, score, idx in results:
+                row = contact_rows[idx]
+                matched[row["id"]] = row
 
-    logger.info(f"  {platform['name']}: {len(all_results)} unique search results")
-    return all_results
+    # Strategy 2: slug/ats exact match (covers abbreviation slugs and migrated contacts)
+    if slug and ats:
+        for row in contact_rows:
+            if row.get("slug") == slug and row.get("ats") == ats:
+                matched[row["id"]] = row
 
-# ─── URL PARSING ──────────────────────────────────────────────────────────────
+    return list(matched.values())
 
-def parse_search_results(results: list[dict], platform: dict) -> list[dict]:
-    """
-    Parse Serper results into structured job stubs.
-    Returns [{"company_slug", "job_id", "url", "company_name"}], deduplicated.
-    """
-    seen = set()
-    parsed = []
-    url_re   = platform["url_re"]
-    title_re = platform.get("title_re")
-    pname    = platform["name"]
-
-    for r in results:
-        url = r.get("link", "")
-        m   = url_re.search(url)
-        if not m:
-            continue
-
-        # group(1) may be None for Wellfound /jobs/i/ URLs (no company in path)
-        slug    = (m.group(1) or "").lower() or f"{pname}-job"
-        job_id  = m.group(2)
-        key = (slug, job_id)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        # Extract company name from search result title
-        company_name = ""
-        search_title = r.get("title", "")
-        if title_re and search_title:
-            tm = title_re.search(search_title)
-            if tm:
-                candidate = tm.group(1).strip()
-                # For Rippling, reject generic suffix-only matches
-                if pname == "rippling" and candidate.lower() in _RIPPLING_GENERIC:
-                    candidate = ""
-                company_name = candidate
-
-        if not company_name:
-            company_name = slug_to_name(slug)
-
-        parsed.append({
-            "company_slug": slug,
-            "job_id":       job_id,
-            "url":          url,
-            "company_name": company_name,
-        })
-
-    logger.info(f"  {pname}: {len(parsed)} unique job URLs parsed")
-    return parsed
 
 # ─── GREENHOUSE ───────────────────────────────────────────────────────────────
 
-def fetch_greenhouse_job(slug: str, job_id: str, company_name: str, has_contact: bool) -> Optional[dict]:
+_DEAD = "DEAD"   # sentinel returned by poll functions for permanent failures
+
+
+def poll_greenhouse(company: dict):
+    """
+    Fetch all open jobs for a Greenhouse company.
+    Returns stubs without descriptions — descriptions fetched on demand for title matches.
+    Returns _DEAD sentinel on permanent failures (404).
+    """
+    slug = company["slug"]
+    try:
+        resp = requests.get(
+            f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return _DEAD
+        resp.raise_for_status()
+        stubs = []
+        for job in resp.json().get("jobs", []):
+            stubs.append({
+                "id":           f"gh_{job['id']}",
+                "_job_id":      str(job["id"]),
+                "title":        job.get("title", ""),
+                "company_slug": slug,
+                "company_name": company.get("name") or slug_to_name(slug),
+                "ats":          "greenhouse",
+                "url":          job.get("absolute_url", f"https://boards.greenhouse.io/{slug}/jobs/{job['id']}"),
+                "location":     (job.get("location") or {}).get("name", ""),
+                "posted_at":    job.get("updated_at", ""),
+                "description":  "",
+            })
+        return stubs
+    except Exception as e:
+        logger.error(f"Greenhouse poll error ({slug}): {e}")
+        return []
+
+
+def fetch_greenhouse_job(slug: str, job_id: str, company_name: str) -> Optional[dict]:
+    """Fetch a single Greenhouse job with full description."""
     url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{job_id}?content=true"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 404:
-            logger.debug(f"Greenhouse 404: {slug}/{job_id}")
+            logger.debug(f"Greenhouse job 404: {slug}/{job_id}")
             return None
         resp.raise_for_status()
         job = resp.json()
@@ -352,370 +320,175 @@ def fetch_greenhouse_job(slug: str, job_id: str, company_name: str, has_contact:
             "ats":          "greenhouse",
             "url":          job.get("absolute_url", f"https://boards.greenhouse.io/{slug}/jobs/{job_id}"),
             "location":     (job.get("location") or {}).get("name", ""),
-            "posted_at":    job.get("updated_at", ""),   # Greenhouse uses updated_at
+            "posted_at":    job.get("updated_at", ""),
             "description":  strip_html(job.get("content", "")),
-            "has_contact":  has_contact,
         }
     except Exception as e:
-        logger.error(f"Greenhouse fetch error ({slug}/{job_id}): {e}")
+        logger.error(f"Greenhouse detail fetch error ({slug}/{job_id}): {e}")
         return None
 
-# ─── ASHBY ────────────────────────────────────────────────────────────────────
-
-def fetch_ashby_company_jobs(
-    slug: str, job_ids: set, company_name: str, has_contact: bool
-) -> list[dict]:
-    """
-    Fetch the full Ashby job board for one company, return only jobs whose
-    UUID appears in job_ids. One API call per company (batched).
-    """
-    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 404:
-            return []
-        resp.raise_for_status()
-        data     = resp.json()
-        org_name = (data.get("organization") or {}).get("name") or company_name
-        results  = []
-        for job in data.get("jobs", []):
-            if job.get("id") not in job_ids:
-                continue
-            results.append({
-                "id":           f"ash_{job['id']}",
-                "title":        job.get("title", ""),
-                "company_slug": slug,
-                "company_name": org_name,
-                "ats":          "ashby",
-                "url":          job.get("jobUrl", f"https://jobs.ashbyhq.com/{slug}/{job['id']}"),
-                "location":     job.get("locationName") or job.get("location") or "",
-                "posted_at":    job.get("publishedDate", ""),
-                "description":  strip_html(job.get("descriptionHtml") or job.get("description", "")),
-                "has_contact":  has_contact,
-            })
-        return results
-    except Exception as e:
-        logger.error(f"Ashby fetch error ({slug}): {e}")
-        return []
-
-# ─── RIPPLING ─────────────────────────────────────────────────────────────────
-
-def fetch_rippling_job(
-    slug: str, job_id: str, job_url: str, company_name: str, has_contact: bool
-) -> Optional[dict]:
-    """
-    Scrape a Rippling job page (server-side rendered HTML).
-    Rippling has no public JSON API, so we parse the page directly.
-    Falls back gracefully if Cloudflare or other protection blocks the request.
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    title       = ""
-    location    = ""
-    description = ""
-    posted_at   = ""
-
-    try:
-        resp = requests.get(job_url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # 1. Try JSON-LD structured data (most reliable when present)
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or "")
-                if isinstance(data, dict) and "JobPosting" in str(data.get("@type", "")):
-                    title       = data.get("title", "")
-                    description = strip_html(data.get("description", ""))
-                    posted_at   = data.get("datePosted", "")
-                    loc         = data.get("jobLocation") or {}
-                    if isinstance(loc, list):
-                        loc = loc[0] if loc else {}
-                    location = (loc.get("address") or {}).get("addressLocality", "")
-                    break
-            except Exception:
-                continue
-
-        # 2. Fallback: scrape visible HTML
-        if not title:
-            h1 = soup.find("h1")
-            if h1:
-                title = h1.get_text(strip=True)
-
-        if not description:
-            for sel in ("[data-testid='job-description']", ".job-description", "main", "article"):
-                el = soup.select_one(sel)
-                if el:
-                    description = el.get_text(separator=" ", strip=True)[:3000]
-                    break
-
-        if not location:
-            text = soup.get_text()
-            m = re.search(r"(?:Location|location)[:\s]+([^\n|•]+)", text)
-            if m:
-                location = m.group(1).strip()
-
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        if code == 404:
-            logger.debug(f"Rippling 404 (stale search result): {slug}/{job_id}")
-        elif code in (403, 503):
-            logger.warning(f"Rippling {slug}: Cloudflare blocked ({code}), description unavailable")
-        else:
-            logger.error(f"Rippling HTTP error ({slug}/{job_id}): {e}")
-    except Exception as e:
-        logger.error(f"Rippling scrape error ({slug}/{job_id}): {e}")
-
-    return {
-        "id":           f"rp_{job_id}",
-        "title":        title or "",
-        "company_slug": slug,
-        "company_name": company_name,
-        "ats":          "rippling",
-        "url":          job_url,
-        "location":     location,
-        "posted_at":    posted_at,
-        "description":  description,
-        "has_contact":  has_contact,
-    }
 
 # ─── LEVER ────────────────────────────────────────────────────────────────────
 
-def fetch_lever_job(slug: str, job_id: str, company_name: str, has_contact: bool) -> Optional[dict]:
-    url = f"https://api.lever.co/v0/postings/{slug}/{job_id}?mode=json"
+def poll_lever(company: dict):
+    """Fetch all open jobs for a Lever company, including full descriptions."""
+    slug = company["slug"]
+    name = company.get("name") or slug_to_name(slug)
     try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        job = resp.json()
-
-        posted_at = ""
-        if job.get("createdAt"):
-            posted_at = datetime.fromtimestamp(
-                job["createdAt"] / 1000, tz=timezone.utc
-            ).isoformat()
-
-        cats     = job.get("categories") or {}
-        location = cats.get("location", "") or (
-            cats.get("allLocations", [""])[0]
-            if isinstance(cats.get("allLocations"), list)
-            else ""
+        resp = requests.get(
+            f"https://api.lever.co/v0/postings/{slug}?mode=json",
+            timeout=10,
         )
-
-        parts = [job.get("descriptionPlain", "")]
-        for lst in job.get("lists", []):
-            items = " ".join(lst.get("content", []))
-            parts.append(f"{lst.get('text', '')}: {items}")
-
-        return {
-            "id":           f"lv_{job_id}",
-            "title":        job.get("text", ""),
-            "company_slug": slug,
-            "company_name": company_name,
-            "ats":          "lever",
-            "url":          job.get("hostedUrl", f"https://jobs.lever.co/{slug}/{job_id}"),
-            "location":     location,
-            "posted_at":    posted_at,
-            "description":  "\n".join(p for p in parts if p),
-            "has_contact":  has_contact,
-        }
-    except Exception as e:
-        logger.error(f"Lever fetch error ({slug}/{job_id}): {e}")
-        return None
-
-# ─── WELLFOUND ────────────────────────────────────────────────────────────────
-
-def fetch_wellfound_job(
-    slug: str, job_id: str, job_url: str, company_name: str, has_contact: bool
-) -> Optional[dict]:
-    """Scrape a Wellfound job page. Falls back gracefully if blocked."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    title = ""
-    description = ""
-    location = ""
-
-    try:
-        resp = requests.get(job_url, headers=headers, timeout=15)
+        if resp.status_code == 404:
+            return _DEAD
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # Try JSON-LD first
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or "")
-                if "JobPosting" in str(data.get("@type", "")):
-                    title       = data.get("title", "")
-                    description = strip_html(data.get("description", ""))
-                    loc         = data.get("jobLocation") or {}
-                    if isinstance(loc, list):
-                        loc = loc[0] if loc else {}
-                    location = (loc.get("address") or {}).get("addressLocality", "")
-                    break
-            except Exception:
+        jobs = []
+        for job in resp.json():
+            if not isinstance(job, dict):
                 continue
-
-        # Fallback: HTML
-        if not title:
-            h1 = soup.find("h1")
-            if h1:
-                title = h1.get_text(strip=True)
-        if not description:
-            for sel in ["[class*='description']", "[class*='job-description']", "main"]:
-                el = soup.select_one(sel)
-                if el:
-                    description = el.get_text(separator=" ", strip=True)[:6000]
-                    break
-
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        if code == 404:
-            logger.debug(f"Wellfound 404 (stale): {job_url}")
-            return None
-        logger.warning(f"Wellfound {code} for {slug}/{job_id}")
+            job_id    = job.get("id", "")
+            posted_at = ""
+            if job.get("createdAt"):
+                posted_at = datetime.fromtimestamp(
+                    job["createdAt"] / 1000, tz=timezone.utc
+                ).isoformat()
+            cats     = job.get("categories") or {}
+            location = cats.get("location", "") or (
+                cats.get("allLocations", [""])[0]
+                if isinstance(cats.get("allLocations"), list) else ""
+            )
+            parts = [job.get("descriptionPlain", "")]
+            for lst in job.get("lists", []):
+                items = " ".join(lst.get("content", []))
+                parts.append(f"{lst.get('text', '')}: {items}")
+            jobs.append({
+                "id":           f"lv_{job_id}",
+                "title":        job.get("text", ""),
+                "company_slug": slug,
+                "company_name": name,
+                "ats":          "lever",
+                "url":          job.get("hostedUrl", f"https://jobs.lever.co/{slug}/{job_id}"),
+                "location":     location,
+                "posted_at":    posted_at,
+                "description":  "\n".join(p for p in parts if p),
+            })
+        return jobs
     except Exception as e:
-        logger.error(f"Wellfound fetch error ({slug}/{job_id}): {e}")
-
-    return {
-        "id":           f"wf_{job_id}",
-        "title":        title or "",
-        "company_slug": slug,
-        "company_name": company_name,
-        "ats":          "wellfound",
-        "url":          job_url,
-        "location":     location,
-        "posted_at":    "",
-        "description":  description,
-        "has_contact":  has_contact,
-    }
+        logger.error(f"Lever poll error ({slug}): {e}")
+        return []
 
 
-# ─── WORKDAY ──────────────────────────────────────────────────────────────────
+# ─── ASHBY ────────────────────────────────────────────────────────────────────
 
-def fetch_workday_job(
-    slug: str, job_id: str, job_url: str, company_name: str, has_contact: bool
-) -> Optional[dict]:
-    """Scrape a Workday job page (server-side rendered). Falls back gracefully."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    title = ""
-    description = ""
-    location = ""
-    posted_at = ""
+def _parse_ashby_app_data(html: str) -> Optional[dict]:
+    """Extract window.__appData JSON from an Ashby job board page."""
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+    decoder = json.JSONDecoder()
+    for script in scripts:
+        if '__appData' not in script:
+            continue
+        m = re.search(r'window\.__appData\s*=\s*(\{)', script)
+        if not m:
+            continue
+        try:
+            obj, _ = decoder.raw_decode(script, m.start(1))
+            return obj
+        except json.JSONDecodeError:
+            continue
+    return None
 
+
+def poll_ashby(company: dict):
+    """
+    Fetch job stubs from Ashby by scraping window.__appData on the public job board page.
+    The posting-api endpoint now requires auth; page HTML remains public.
+    Returns stubs without descriptions — descriptions fetched on demand for title matches.
+    """
+    slug = company["slug"]
+    name = company.get("name") or slug_to_name(slug)
     try:
-        resp = requests.get(job_url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # Try JSON-LD structured data first
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or "")
-                if "JobPosting" in str(data.get("@type", "")):
-                    title       = data.get("title", "")
-                    description = strip_html(data.get("description", ""))
-                    posted_at   = data.get("datePosted", "")
-                    loc         = data.get("jobLocation") or {}
-                    if isinstance(loc, list):
-                        loc = loc[0] if loc else {}
-                    location = (loc.get("address") or {}).get("addressLocality", "")
-                    break
-            except Exception:
-                continue
-
-        # Fallback: HTML
-        if not title:
-            h1 = soup.find("h1")
-            if h1:
-                title = h1.get_text(strip=True)
-            if not title:
-                pt = soup.find("title")
-                if pt:
-                    title = pt.get_text(strip=True).split(" - ")[0].split(" | ")[0].strip()
-
-        # Last-resort fallback: derive title from URL slug
-        # e.g. "Director-Revenue-Operations_R-123456" → "Director Revenue Operations"
-        if not title:
-            path_slug = job_url.rstrip("/").rsplit("/", 1)[-1]
-            path_slug = re.sub(r"[_-]?[Rr][_-]?\d+(?:[_-]\d+)*$", "", path_slug)  # _R0043379_1
-            path_slug = re.sub(r"[_-][A-Za-z]{1,10}$", "", path_slug)               # _J or _EN locale
-            path_slug = path_slug.strip("-_")
-            title = path_slug.replace("-", " ").replace("_", " ").title()
-
-        if not description:
-            for sel in ["[data-automation-id='jobPostingDescription']",
-                        ".job-description", "main", "article"]:
-                el = soup.select_one(sel)
-                if el:
-                    description = el.get_text(separator=" ", strip=True)[:6000]
-                    break
-
-        if not location:
-            text = soup.get_text()
-            m = re.search(r"(?:Location|location)[:\s]+([^\n|•]+)", text)
-            if m:
-                location = m.group(1).strip()
-
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        if code == 404:
-            logger.debug(f"Workday 404 (stale): {slug}/{job_id}")
-            return None
-        elif code in (403, 503):
-            logger.warning(f"Workday {slug}: blocked ({code}), description unavailable")
-        else:
-            logger.error(f"Workday HTTP error ({slug}/{job_id}): {e}")
+        resp = requests.get(
+            f"https://jobs.ashbyhq.com/{slug}",
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return _DEAD
+        if resp.status_code != 200:
+            return []
+        data = _parse_ashby_app_data(resp.text)
+        if not data:
+            return []
+        org_name = (data.get("organization") or {}).get("name") or name
+        raw_jobs = (data.get("jobBoard") or {}).get("jobPostings") or []
+        stubs = []
+        for job in raw_jobs:
+            job_id  = job.get("id", "")
+            comp    = job.get("compensationTierSummary") or ""
+            stubs.append({
+                "id":            f"ash_{job_id}",
+                "_job_id":       job_id,
+                "_comp_summary": comp,
+                "title":         job.get("title", ""),
+                "company_slug":  slug,
+                "company_name":  org_name,
+                "ats":           "ashby",
+                "url":           f"https://jobs.ashbyhq.com/{slug}/{job_id}",
+                "location":      job.get("locationName") or "",
+                "posted_at":     job.get("publishedDate", ""),
+                "description":   "",
+            })
+        return stubs
     except Exception as e:
-        logger.error(f"Workday fetch error ({slug}/{job_id}): {e}")
-
-    if not description:
-        logger.debug(f"Workday: no description scraped for {slug}/{job_id} — skipping")
-        return None
-
-    return {
-        "id":           f"wd_{job_id}",
-        "title":        title or "",
-        "company_slug": slug,
-        "company_name": company_name,
-        "ats":          "workday",
-        "url":          job_url,
-        "location":     location,
-        "posted_at":    posted_at,
-        "description":  description,
-        "has_contact":  has_contact,
-    }
+        logger.error(f"Ashby poll error ({slug}): {e}")
+        return []
 
 
-# ─── WORKABLE (optional per-company) ─────────────────────────────────────────
+def fetch_ashby_job(stub: dict) -> Optional[dict]:
+    """Fetch full description for an Ashby job from its individual job page HTML."""
+    slug   = stub["company_slug"]
+    job_id = stub.get("_job_id", "")
+    if not job_id:
+        return dict(stub)
+    try:
+        resp = requests.get(
+            f"https://jobs.ashbyhq.com/{slug}/{job_id}",
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return dict(stub)
+        data = _parse_ashby_app_data(resp.text)
+        if not data:
+            return dict(stub)
+        posting = data.get("posting") or {}
+        desc = strip_html(posting.get("descriptionHtml") or "")
+        # Prepend compensation summary from listing data so Claude can see it
+        comp = stub.get("_comp_summary") or ""
+        if comp:
+            desc = f"Compensation: {comp}\n\n{desc}"
+        job = dict(stub)
+        job["description"] = desc
+        return job
+    except Exception as e:
+        logger.error(f"Ashby detail fetch error ({slug}/{job_id}): {e}")
+        return dict(stub)
 
-def fetch_workable_jobs(slug: str, company_name: str, has_contact: bool) -> list[dict]:
-    url = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
+
+# ─── WORKABLE ─────────────────────────────────────────────────────────────────
+
+def poll_workable(company: dict):
+    """Fetch all open jobs for a Workable company."""
+    slug = company["slug"]
+    name = company.get("name") or slug_to_name(slug)
     try:
         resp = requests.post(
-            url, json={"query": "", "location": [], "remote": True}, timeout=15
+            f"https://apply.workable.com/api/v3/accounts/{slug}/jobs",
+            json={},
+            timeout=15,
         )
         if resp.status_code == 404:
-            return []
+            return _DEAD
         resp.raise_for_status()
         jobs = []
         for job in resp.json().get("results", []):
@@ -728,27 +501,107 @@ def fetch_workable_jobs(slug: str, company_name: str, has_contact: bool) -> list
                 "id":           f"wk_{job.get('id', shortcode)}",
                 "title":        job.get("title", ""),
                 "company_slug": slug,
-                "company_name": company_name,
+                "company_name": name,
                 "ats":          "workable",
                 "url":          job.get("url") or f"https://apply.workable.com/{slug}/j/{shortcode}",
                 "location":     ", ".join(p for p in loc_parts if p),
                 "posted_at":    job.get("created_date") or job.get("published_on", ""),
                 "description":  strip_html(job.get("description", "")),
-                "has_contact":  has_contact,
             })
         return jobs
     except Exception as e:
-        logger.error(f"Workable error ({slug}): {e}")
+        logger.error(f"Workable poll error ({slug}): {e}")
         return []
 
-# ─── BREEZY (optional per-company) ───────────────────────────────────────────
 
-def fetch_breezy_jobs(slug: str, company_name: str, has_contact: bool) -> list[dict]:
-    url = f"https://{slug}.breezy.hr/json"
+# ─── BAMBOOHR ─────────────────────────────────────────────────────────────────
+
+def poll_bamboohr(company: dict):
+    """
+    Fetch job stubs from BambooHR careers list.
+    Descriptions are not in the list response — fetched separately for title matches.
+    Returns _DEAD sentinel on permanent failures.
+    """
+    slug = company["slug"]
+    name = company.get("name") or slug_to_name(slug)
     try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 404:
+        resp = requests.get(
+            f"https://{slug}.bamboohr.com/careers/list",
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        if resp.status_code in (404, 401, 403):
+            return _DEAD
+        if resp.status_code >= 500:
             return []
+        resp.raise_for_status()
+        if "application/json" not in resp.headers.get("Content-Type", ""):
+            return _DEAD
+        stubs = []
+        for job in resp.json().get("result", []):
+            loc = job.get("location") or {}
+            if isinstance(loc, dict):
+                location = ", ".join(filter(None, [loc.get("city", ""), loc.get("state", "")]))
+            else:
+                location = str(loc) if loc else ""
+            job_id = str(job.get("id", ""))
+            stubs.append({
+                "id":           f"bhr_{job_id}",
+                "_job_id":      job_id,
+                "title":        job.get("jobOpeningName", ""),
+                "company_slug": slug,
+                "company_name": name,
+                "ats":          "bamboohr",
+                "url":          f"https://{slug}.bamboohr.com/careers/{job_id}",
+                "location":     location,
+                "posted_at":    "",
+                "description":  "",
+            })
+        return stubs
+    except Exception as e:
+        logger.error(f"BambooHR poll error ({slug}): {e}")
+        return []
+
+
+def fetch_bamboohr_job(stub: dict) -> Optional[dict]:
+    """Scrape a BambooHR job detail page and extract the description."""
+    slug   = stub["company_slug"]
+    job_id = stub["_job_id"]
+    url    = stub["url"]
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        desc = ""
+        for selector in ["div.BambooRich", "[data-testid='Prose']", "div.description", "div#app main", "main"]:
+            el = soup.select_one(selector)
+            if el:
+                desc = el.get_text(separator=" ", strip=True)[:4000]
+                break
+        job = dict(stub)
+        job["description"] = desc
+        return job
+    except Exception as e:
+        logger.error(f"BambooHR detail fetch error ({slug}/{job_id}): {e}")
+        return None
+
+
+# ─── BREEZY ───────────────────────────────────────────────────────────────────
+
+def poll_breezy(company: dict):
+    """Fetch all open jobs for a Breezy HR company."""
+    slug = company["slug"]
+    name = company.get("name") or slug_to_name(slug)
+    try:
+        resp = requests.get(f"https://{slug}.breezy.hr/json", timeout=10)
+        if resp.status_code == 404:
+            return _DEAD
         resp.raise_for_status()
         data = resp.json()
         raw  = data if isinstance(data, list) else data.get("positions", data.get("jobs", []))
@@ -762,36 +615,33 @@ def fetch_breezy_jobs(slug: str, company_name: str, has_contact: bool) -> list[d
                 "id":           f"bz_{job.get('_id', job.get('id', ''))}",
                 "title":        job.get("name", job.get("title", "")),
                 "company_slug": slug,
-                "company_name": company_name,
+                "company_name": name,
                 "ats":          "breezy",
                 "url":          job.get("url") or f"https://{slug}.breezy.hr/p/{job.get('_id', '')}",
                 "location":     ", ".join(p for p in loc_parts if p),
                 "posted_at":    job.get("published_date", ""),
                 "description":  strip_html(job.get("description", "")),
-                "has_contact":  has_contact,
             })
         return jobs
     except Exception as e:
-        logger.error(f"Breezy error ({slug}): {e}")
+        logger.error(f"Breezy poll error ({slug}): {e}")
         return []
+
 
 # ─── FILTERING ────────────────────────────────────────────────────────────────
 
-
 def is_relevant_title(title: str) -> bool:
     t = title.lower()
-    # Fast path: direct match against known search phrases
     if any(rt.lower() in t for rt in ROLE_TITLES):
         return True
-    # Flexible path: ops/systems word + GTM domain qualifier
-    has_ops = any(kw in t for kw in _OPS_TERMS)
+    has_ops       = any(kw in t for kw in _OPS_TERMS)
     has_qualifier = any(q in t for q in _DOMAIN_QUALS)
     return has_ops and has_qualifier
 
 
 def is_within_lookback(posted_at: str, hours: int) -> bool:
     if not posted_at:
-        return True  # No date = include (err on side of inclusion)
+        return True  # no date = include (err on side of inclusion)
     dt = parse_iso_date(posted_at)
     if dt is None:
         return True
@@ -801,21 +651,17 @@ def is_within_lookback(posted_at: str, hours: int) -> bool:
 def passes_hard_filters(job: dict) -> bool:
     title_lower = job.get("title", "").lower()
 
-    # Exclude known job aggregators (not real employers)
     if job.get("company_slug", "") in HARD_FILTERS["exclude_company_slugs"]:
         return False
 
-    # Exclude by title keyword
     for kw in HARD_FILTERS["exclude_keywords"]:
         if kw.lower() in title_lower:
             return False
 
-    # Location gate
     if HARD_FILTERS["require_remote_or_austin"]:
         loc        = (job.get("location") or "").lower()
         desc_start = (job.get("description") or "")[:500].lower()
 
-        # Reject any job that explicitly names a non-US country
         non_us_countries = (
             "canada", "united kingdom", "uk ", " uk,", "europe", "germany",
             "france", "australia", "india", "mexico", "netherlands", "ireland",
@@ -825,7 +671,6 @@ def passes_hard_filters(job: dict) -> bool:
         )
         if any(c in loc for c in non_us_countries):
             return False
-        # Catch location restrictions buried in the job description opening
         if any(c in desc_start for c in non_us_countries):
             return False
 
@@ -843,78 +688,215 @@ def passes_hard_filters(job: dict) -> bool:
 
     return True
 
+
 # ─── SEEN JOBS CACHE ──────────────────────────────────────────────────────────
 
-def load_seen() -> dict:
+def load_seen(sb: Optional[Client]) -> Set[str]:
+    """
+    Load seen job IDs from the Supabase jobs table (preferred) or local JSON fallback.
+    The jobs table is the source of truth — seen_jobs table has been removed.
+    Returns a set of job ID strings seen within the last 30 days.
+    """
+    if sb:
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            result = sb.table("jobs").select("job_id").gte("last_seen_at", cutoff).execute()
+            return {row["job_id"] for row in (result.data or [])}
+        except Exception as e:
+            logger.warning(f"Supabase jobs dedup load failed, falling back to local: {e}")
+
+    # Local JSON fallback (used when Supabase is unreachable)
     if not os.path.exists(SEEN_JOBS_FILE):
-        return {}
+        return set()
     try:
         with open(SEEN_JOBS_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        return {k for k, v in data.items() if v >= cutoff}
     except Exception:
-        return {}
+        return set()
 
 
-def save_seen(seen: dict) -> None:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    pruned = {k: v for k, v in seen.items() if v >= cutoff}
+def save_seen(sb: Optional[Client], new_ids: List[str]) -> None:
+    """
+    Update the local JSON fallback with newly seen job IDs.
+    Supabase persistence is handled by save_scored_job() — no separate seen_jobs write needed.
+    """
+    if not new_ids:
+        return
+    # Local JSON fallback only — keeps dedup working if Supabase was unreachable this run
     try:
+        existing = {}
+        if os.path.exists(SEEN_JOBS_FILE):
+            with open(SEEN_JOBS_FILE) as f:
+                existing = json.load(f)
+        now = datetime.now(timezone.utc).isoformat()
+        for jid in new_ids:
+            existing[jid] = now
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        pruned = {k: v for k, v in existing.items() if v >= cutoff}
         with open(SEEN_JOBS_FILE, "w") as f:
             json.dump(pruned, f)
     except Exception as e:
-        logger.error(f"Failed to save seen cache: {e}")
+        logger.error(f"Failed to update local seen cache: {e}")
+
+
+# ─── DEAD SLUG CACHE ──────────────────────────────────────────────────────────
+# Tracks companies that consistently fail (404, 401, timeout) so we skip them
+# for 30 days instead of wasting time on every run.
+
+def load_dead_slugs(sb: Optional[Client]) -> Set[str]:
+    """
+    Load dead slugs from Supabase (preferred) or local JSON fallback.
+    Returns a set of "ats/slug" strings.
+    """
+    if sb:
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            result = (
+                sb.table("dead_slugs")
+                .select("ats, slug")
+                .gte("cached_at", cutoff)
+                .execute()
+            )
+            return {f"{row['ats']}/{row['slug']}" for row in (result.data or [])}
+        except Exception as e:
+            logger.warning(f"Supabase dead_slugs load failed, falling back to local: {e}")
+
+    # Local JSON fallback
+    if not os.path.exists(DEAD_SLUGS_FILE):
+        return set()
+    try:
+        with open(DEAD_SLUGS_FILE) as f:
+            data = json.load(f)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        return {k for k, v in data.items() if v >= cutoff}
+    except Exception:
+        return set()
+
+
+def save_dead_slugs(sb: Optional[Client], new_dead: Set[str]) -> None:
+    """Persist newly discovered dead slugs. Only saves new ones."""
+    if not new_dead:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+
+    if sb:
+        try:
+            rows = []
+            for key in new_dead:
+                parts = key.split("/", 1)
+                if len(parts) == 2:
+                    rows.append({"ats": parts[0], "slug": parts[1], "cached_at": now})
+            for i in range(0, len(rows), 500):
+                sb.table("dead_slugs").upsert(rows[i:i+500]).execute()
+            return
+        except Exception as e:
+            logger.warning(f"Supabase dead_slugs save failed, falling back to local: {e}")
+
+    # Local JSON fallback
+    try:
+        existing = {}
+        if os.path.exists(DEAD_SLUGS_FILE):
+            with open(DEAD_SLUGS_FILE) as f:
+                existing = json.load(f)
+        for key in new_dead:
+            existing[key] = now
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        pruned = {k: v for k, v in existing.items() if v >= cutoff}
+        with open(DEAD_SLUGS_FILE, "w") as f:
+            json.dump(pruned, f)
+    except Exception as e:
+        logger.error(f"Failed to save dead slugs cache: {e}")
+
 
 # ─── SCORING ──────────────────────────────────────────────────────────────────
 
-def score_job(job: dict, has_contact: bool) -> dict:
-    client      = Anthropic(api_key=ANTHROPIC_API_KEY)
-    description = (job.get("description") or "")[:6000]
+# Anthropic client — created once per process, reused across all scoring calls
+_anthropic_client: Optional[Anthropic] = None
 
-    prompt = f"""You are evaluating a job posting for a specific candidate. Score the fit and provide actionable insights.
+# System prompt with cache_control — built once at module load from constants.
+# The Anthropic API caches this prefix (5-min TTL, resets on each cache hit),
+# so every job after the first pays ~10% of normal input cost for these tokens.
+_SCORING_SYSTEM: list = [
+    {
+        "type": "text",
+        "text": (
+            "You are evaluating job postings for a specific candidate. "
+            "Score the fit and provide actionable insights.\n\n"
+            "CANDIDATE PROFILE:\n" + CANDIDATE_PROFILE + "\n\n"
+            "MANDATORY SCORING RULES — apply these before general fit assessment:\n"
+            + SCORING_RULES
+            + "\n\n"
+            'Respond ONLY with a JSON object (no markdown, no explanation):\n'
+            '{\n'
+            '  "score": <integer 0-100, after applying all mandatory rules above>,\n'
+            '  "tier": <"A" if score>=80, "B" if 60-79, "C" if 40-59, "skip" if <40>,\n'
+            '  "title_match": <true/false>,\n'
+            '  "location_ok": <true/false>,\n'
+            '  "top_matches": [<3 specific reasons this is a strong match>],\n'
+            '  "gaps": [<up to 3 specific gaps or concerns, referencing mandatory rules where triggered>],\n'
+            '  "apply_urgency": <"high"|"medium"|"low">,\n'
+            '  "one_liner": <one sentence summary of fit, max 20 words>,\n'
+            '  "outreach_angle": <if has_contact true: one sentence on best angle for reaching out, else null>\n'
+            '}\n\n'
+            "Scoring guide (before mandatory rule adjustments):\n"
+            "- 80-100: Strong match on scope, industry, and skills\n"
+            "- 60-79: Good match with minor gaps, worth applying\n"
+            "- 40-59: Partial match, missing key elements\n"
+            "- Below 40: Poor fit, skip"
+        ),
+        "cache_control": {"type": "ephemeral"},
+    }
+]
 
-CANDIDATE PROFILE:
-{CANDIDATE_PROFILE}
 
-JOB POSTING:
-Title: {job['title']}
-Company: {job['company_name']}
-Location: {job.get('location', '')}
-ATS: {job['ats']}
-URL: {job['url']}
+def score_job(job: dict, contacts: List[dict]) -> dict:
+    """
+    Score a job against the candidate profile.
+    contacts: all matching rows from the contacts table (may be empty).
+    All contact names/roles are included in the user message so Claude can
+    personalize outreach_angle and reference specific connections.
+    """
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-Description:
-{description}
+    has_contact = len(contacts) > 0
+    if has_contact:
+        names = ", ".join(
+            f"{c.get('contact_name') or 'Unknown'} ({c.get('contact_role') or 'unknown role'})"
+            for c in contacts
+        )
+        contact_line = f"has_contact: true  # connections: {names}\n"
+    else:
+        contact_line = "has_contact: false\n"
 
-has_contact: {has_contact}
-
-MANDATORY SCORING RULES — apply these before general fit assessment:
-{SCORING_RULES}
-
-Respond ONLY with a JSON object (no markdown, no explanation):
-{{
-  "score": <integer 0-100, after applying all mandatory rules above>,
-  "tier": <"A" if score>=80, "B" if 60-79, "C" if 40-59, "skip" if <40>,
-  "title_match": <true/false>,
-  "location_ok": <true/false>,
-  "top_matches": [<3 specific reasons this is a strong match>],
-  "gaps": [<up to 3 specific gaps or concerns, referencing mandatory rules where triggered>],
-  "apply_urgency": <"high"|"medium"|"low">,
-  "one_liner": <one sentence summary of fit, max 20 words>,
-  "outreach_angle": <if has_contact true: one sentence on best angle for reaching out, else null>
-}}
-
-Scoring guide (before mandatory rule adjustments):
-- 80-100: Strong match on scope, industry, and skills
-- 60-79: Good match with minor gaps, worth applying
-- 40-59: Partial match, missing key elements
-- Below 40: Poor fit, skip"""
+    user_content = (
+        f"Title: {job['title']}\n"
+        f"Company: {job['company_name']}\n"
+        f"Location: {job.get('location', '')}\n"
+        f"ATS: {job['ats']}\n"
+        f"URL: {job['url']}\n"
+        f"{contact_line}\n"
+        f"Description:\n{job.get('description') or ''}"
+    )
 
     try:
-        response = client.messages.create(
+        response = _anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
+            system=_SCORING_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
         )
+        usage = response.usage
+        cached  = getattr(usage, "cache_read_input_tokens", 0) or 0
+        written = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        if cached:
+            logger.info(f"  Cache hit — {cached:,} tokens served from cache")
+        elif written:
+            logger.info(f"  Cache write — {written:,} tokens cached for this run")
+
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -923,7 +905,8 @@ Scoring guide (before mandatory rule adjustments):
         scoring = json.loads(raw.strip())
         if has_contact:
             scoring["score"] = min(100, scoring["score"] + CONTACT_SCORE_BOOST)
-        scoring["has_contact"] = has_contact
+        scoring["has_contact"]   = has_contact
+        scoring["contact_count"] = len(contacts)
         return scoring
     except Exception as e:
         logger.error(f"Scoring error for '{job.get('title', '?')}': {e}")
@@ -932,13 +915,13 @@ Scoring guide (before mandatory rule adjustments):
             "top_matches": ["Could not auto-score — review manually"],
             "gaps": ["Scoring failed"], "apply_urgency": "medium",
             "one_liner": "Manual review needed",
-            "outreach_angle": None, "has_contact": has_contact,
+            "outreach_angle": None, "has_contact": has_contact, "contact_count": len(contacts),
         }
+
 
 # ─── PUSHOVER ─────────────────────────────────────────────────────────────────
 
 def send_pushover(job: dict, scoring: dict) -> None:
-    """Send a Pushover push notification for a Tier A job. No-ops if keys not set."""
     if not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN:
         return
     company = job.get("company_name", job.get("company_slug", ""))
@@ -952,12 +935,12 @@ def send_pushover(job: dict, scoring: dict) -> None:
         requests.post(
             "https://api.pushover.net/1/messages.json",
             data={
-                "token":    PUSHOVER_APP_TOKEN,
-                "user":     PUSHOVER_USER_KEY,
-                "title":    title,
-                "message":  message,
-                "priority": 1 if scoring.get("apply_urgency") == "high" else 0,
-                "url":      job.get("url", ""),
+                "token":     PUSHOVER_APP_TOKEN,
+                "user":      PUSHOVER_USER_KEY,
+                "title":     title,
+                "message":   message,
+                "priority":  1 if scoring.get("apply_urgency") == "high" else 0,
+                "url":       job.get("url", ""),
                 "url_title": "View Job",
             },
             timeout=10,
@@ -965,6 +948,33 @@ def send_pushover(job: dict, scoring: dict) -> None:
         logger.info(f"Pushover sent for: {job['title']} @ {company}")
     except Exception as e:
         logger.error(f"Pushover error: {e}")
+
+
+# ─── JOBS (Supabase analytics) ────────────────────────────────────────────────
+
+def save_scored_job(sb: Optional[Client], job: dict, scoring: dict, pushed_to_notion: bool) -> None:
+    """Persist a scored job to the Supabase jobs table for analytics."""
+    if not sb:
+        return
+    try:
+        row = {
+            "job_id":           job.get("id", ""),
+            "ats":              job.get("ats", ""),
+            "company_slug":     job.get("company_slug", ""),
+            "title":            job.get("title", ""),
+            "location":         job.get("location", ""),
+            "url":              job.get("url", ""),
+            "score":            scoring.get("score"),
+            "tier":             scoring.get("tier"),
+            "gaps":             " | ".join(scoring.get("gaps") or []),
+            "top_matches":      " | ".join(scoring.get("top_matches") or []),
+            "posted_at":        (job.get("posted_at") or "")[:10] or None,
+            "pushed_to_notion": pushed_to_notion,
+            "last_seen_at":     datetime.now(timezone.utc).isoformat(),
+        }
+        sb.table("jobs").upsert(row, on_conflict="job_id").execute()
+    except Exception as e:
+        logger.warning(f"Failed to save job to Supabase jobs table: {e}")
 
 
 # ─── NOTION ───────────────────────────────────────────────────────────────────
@@ -1016,13 +1026,14 @@ def push_to_notion(job: dict, scoring: dict) -> bool:
         logger.error(f"Notion push error ('{job.get('title', '?')}'): {e}")
         return False
 
+
 # ─── DRY-RUN OUTPUT ───────────────────────────────────────────────────────────
 
 def print_job(job: dict, scoring: dict) -> None:
     company = job.get("company_name", job.get("company_slug", ""))
     print(f"\n{'='*60}")
     print(f"TITLE: {job['title']}")
-    print(f"COMPANY: {company} | HAS CONTACT: {job.get('has_contact', False)}")
+    print(f"COMPANY: {company} | HAS CONTACT: {scoring.get('has_contact', False)}")
     print(f"LOCATION: {job.get('location', '')}")
     print(f"SCORE: {scoring['score']} ({scoring['tier']}) | URGENCY: {scoring['apply_urgency']}")
     print(f"ONE LINER: {scoring['one_liner']}")
@@ -1033,115 +1044,173 @@ def print_job(job: dict, scoring: dict) -> None:
     print(f"URL: {job.get('url', '')}")
     print("="*60)
 
+
 # ─── MAIN ORCHESTRATION ───────────────────────────────────────────────────────
 
-def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list[dict]:
-    logger.info(f"Job Scout starting — lookback={hours_back}h | dry_run={dry_run}")
+def _poll_one_company(company: dict, seen: Set[str], skippable_dead: Set[str]) -> Tuple[List[dict], Set[str]]:
+    """
+    Poll a single company's ATS. Returns (candidates, new_dead_keys).
+    Called in parallel from worker threads — no shared mutable state written here.
+    """
+    ats      = (company.get("ats") or "").lower()
+    slug     = company.get("slug", "")
+    dead_key = f"{ats}/{slug}"
+    candidates: List[dict] = []
+    new_dead:   Set[str]   = set()
 
-    seen      = load_seen()
+    if not slug or not ats:
+        return candidates, new_dead
+    if dead_key in skippable_dead:
+        return candidates, new_dead
+
+    try:
+        if ats == "greenhouse":
+            stubs = poll_greenhouse(company)
+            if stubs is _DEAD:
+                new_dead.add(dead_key)
+            else:
+                for stub in stubs:
+                    if stub["id"] in seen or not is_relevant_title(stub["title"]):
+                        continue
+                    job = fetch_greenhouse_job(stub["company_slug"], stub["_job_id"], stub["company_name"])
+                    if job:
+                        candidates.append(job)
+
+        elif ats == "lever":
+            result = poll_lever(company)
+            if result is _DEAD:
+                new_dead.add(dead_key)
+            else:
+                candidates.extend(j for j in result if j["id"] not in seen and is_relevant_title(j["title"]))
+
+        elif ats == "ashby":
+            stubs = poll_ashby(company)
+            if stubs is _DEAD:
+                new_dead.add(dead_key)
+            else:
+                for stub in stubs:
+                    if stub["id"] in seen or not is_relevant_title(stub["title"]):
+                        continue
+                    job = fetch_ashby_job(stub)
+                    if job:
+                        candidates.append(job)
+
+        elif ats == "workable":
+            result = poll_workable(company)
+            if result is _DEAD:
+                new_dead.add(dead_key)
+            else:
+                candidates.extend(j for j in result if j["id"] not in seen and is_relevant_title(j["title"]))
+
+        elif ats == "bamboohr":
+            stubs = poll_bamboohr(company)
+            if stubs is _DEAD:
+                new_dead.add(dead_key)
+            else:
+                for stub in stubs:
+                    if stub["id"] in seen or not is_relevant_title(stub["title"]):
+                        continue
+                    job = fetch_bamboohr_job(stub)
+                    if job:
+                        candidates.append(job)
+
+        elif ats == "breezy":
+            result = poll_breezy(company)
+            if result is _DEAD:
+                new_dead.add(dead_key)
+            else:
+                candidates.extend(j for j in result if j["id"] not in seen and is_relevant_title(j["title"]))
+
+        else:
+            logger.debug(f"Unknown ATS '{ats}' for {slug} — skipping")
+
+    except Exception as e:
+        logger.error(f"Error polling {ats}/{slug}: {e}")
+
+    return candidates, new_dead
+
+
+def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
+    logger.info(f"Job Scout starting — Supabase + parallel polling | dry_run={dry_run} | lookback={hours_back}h")
+
+    sb        = _get_supabase()
+    seen      = load_seen(sb)
+    dead      = load_dead_slugs(sb)
     companies = load_companies()
-    contact_slugs  = {c["slug"] for c in companies if c.get("has_contact")}
-    watch_slugs    = {c["slug"] for c in companies if c.get("priority") == "Watch"}
-    high_slugs     = {c["slug"] for c in companies if c.get("priority") == "High"}
-    # always_surface: contact, watch, and high priority companies all bypass score threshold
-    always_surface = contact_slugs | watch_slugs | high_slugs
 
-    all_jobs: list[dict] = []
+    if not companies:
+        logger.error("No companies loaded — check SUPABASE_URL and SUPABASE_KEY")
+        return []
 
-    # ── Search-based discovery ─────────────────────────────────────────────────
-    for platform in PLATFORMS:
-        raw     = search_platform(platform)
-        parsed  = parse_search_results(raw, platform)
-        pname   = platform["name"]
+    # Load watchlist and contacts index — used at scoring time, not at poll time.
+    watchlist               = load_watchlist(sb) if sb else {}
+    contact_norm_names, contact_rows = load_contacts_index(sb) if sb else ([], [])
 
-        if pname == "greenhouse":
-            for p in parsed:
-                job_key = f"gh_{p['job_id']}"
-                if job_key in seen:
-                    continue
-                hc  = p["company_slug"] in contact_slugs
-                job = fetch_greenhouse_job(p["company_slug"], p["job_id"], p["company_name"], hc)
-                if job:
-                    all_jobs.append(job)
-                time.sleep(0.3)
+    watch_slugs    = {slug for (slug, ats), w in watchlist.items() if w["priority"] == "watch"}
+    high_slugs     = {slug for (slug, ats), w in watchlist.items() if w["priority"] == "high"}
+    always_surface = watch_slugs | high_slugs
 
-        elif pname == "ashby":
-            # Batch by company: one board API call per unique company slug
-            by_company:    defaultdict[str, set]  = defaultdict(set)
-            company_names: dict[str, str]         = {}
-            for p in parsed:
-                job_key = f"ash_{p['job_id']}"
-                if job_key not in seen:
-                    by_company[p["company_slug"]].add(p["job_id"])
-                    company_names[p["company_slug"]] = p["company_name"]
-            for slug, job_ids in by_company.items():
-                hc   = slug in contact_slugs
-                jobs = fetch_ashby_company_jobs(slug, job_ids, company_names[slug], hc)
-                all_jobs.extend(jobs)
-                time.sleep(0.3)
+    # Never skip watchlist companies regardless of dead cache.
+    # Contact boost is determined at scoring time, not poll time.
+    skippable_dead = {k for k in dead if k.split("/", 1)[-1] not in always_surface}
 
-        elif pname == "rippling":
-            for p in parsed:
-                job_key = f"rp_{p['job_id']}"
-                if job_key in seen:
-                    continue
-                hc  = p["company_slug"] in contact_slugs
-                job = fetch_rippling_job(
-                    p["company_slug"], p["job_id"], p["url"], p["company_name"], hc
-                )
-                if job:
-                    all_jobs.append(job)
-                time.sleep(0.5)  # slightly longer — HTML scraping
+    logger.info(
+        f"Companies: {len(companies)} total | "
+        f"{len(contact_rows)} contacts in index | {len(watch_slugs)} watch | {len(high_slugs)} high | "
+        f"{len(skippable_dead)} cached dead"
+    )
 
-        elif pname == "lever":
-            for p in parsed:
-                job_key = f"lv_{p['job_id']}"
-                if job_key in seen:
-                    continue
-                hc  = p["company_slug"] in contact_slugs
-                job = fetch_lever_job(p["company_slug"], p["job_id"], p["company_name"], hc)
-                if job:
-                    all_jobs.append(job)
-                time.sleep(0.3)
+    # ── Parallel ATS polling ───────────────────────────────────────────────────
+    # Group companies by ATS platform, run each platform with its own worker pool
+    by_ats: Dict[str, List[dict]] = {}
+    for c in companies:
+        ats = (c.get("ats") or "").lower()
+        if ats:
+            by_ats.setdefault(ats, []).append(c)
 
-        elif pname == "workday":
-            for p in parsed:
-                job_key = f"wd_{p['job_id']}"
-                if job_key in seen:
-                    continue
-                hc  = p["company_slug"] in contact_slugs
-                job = fetch_workday_job(
-                    p["company_slug"], p["job_id"], p["url"], p["company_name"], hc
-                )
-                if job:
-                    all_jobs.append(job)
-                time.sleep(0.5)
+    all_candidates: List[dict] = []
+    all_new_dead:   Set[str]   = set()
+    total_polled = 0
 
-    # ── Per-company opt-ins (Workable / Breezy from companies.json) ────────────
-    for c in [x for x in companies if x.get("ats") == "workable"]:
-        jobs = fetch_workable_jobs(
-            c["slug"], c.get("name", slug_to_name(c["slug"])), c.get("has_contact", False)
-        )
-        all_jobs.extend(jobs)
-        time.sleep(0.3)
+    for ats, ats_companies in by_ats.items():
+        workers    = PLATFORM_WORKERS.get(ats, 5)
+        active     = [c for c in ats_companies if f"{ats}/{c['slug']}" not in skippable_dead]
+        skip_count = len(ats_companies) - len(active)
+        logger.info(f"  [{ats.upper()}] {len(active)} companies ({skip_count} skipped from dead cache) — {workers} workers")
 
-    for c in [x for x in companies if x.get("ats") == "breezy"]:
-        jobs = fetch_breezy_jobs(
-            c["slug"], c.get("name", slug_to_name(c["slug"])), c.get("has_contact", False)
-        )
-        all_jobs.extend(jobs)
-        time.sleep(0.3)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_poll_one_company, company, seen, skippable_dead): company
+                for company in active
+            }
+            pending_dead: Set[str] = set()
+            for future in as_completed(futures):
+                try:
+                    cands, new_dead = future.result()
+                    all_candidates.extend(cands)
+                    all_new_dead.update(new_dead)
+                    pending_dead.update(new_dead)
+                except Exception as e:
+                    co = futures[future]
+                    logger.error(f"Worker error for {co.get('ats')}/{co.get('slug')}: {e}")
+                total_polled += 1
+                # Flush dead slugs to Supabase every 500 to preserve progress on cancel
+                if len(pending_dead) >= 500:
+                    save_dead_slugs(sb, pending_dead)
+                    pending_dead.clear()
 
-    logger.info(f"Total jobs fetched: {len(all_jobs)}")
+            # Flush any remaining dead slugs for this platform
+            if pending_dead:
+                save_dead_slugs(sb, pending_dead)
+                pending_dead.clear()
+
+        logger.info(f"  [{ats.upper()}] done — {len(all_candidates)} candidates so far")
+
+    logger.info(f"Polling complete: {total_polled} companies polled | {len(all_candidates)} candidates | {len(all_new_dead)} new dead")
 
     # ── Filter ─────────────────────────────────────────────────────────────────
-    # Order: title match → already seen → hard filters → date (contact skips date)
-    relevant: list[dict] = []
-    for job in all_jobs:
-        if not is_relevant_title(job.get("title", "")):
-            continue
-        if job["id"] in seen:
-            continue
+    relevant: list = []
+    for job in all_candidates:
         if not passes_hard_filters(job):
             continue
         is_priority = job.get("company_slug", "") in always_surface
@@ -1151,34 +1220,67 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list[d
 
     logger.info(f"Relevant new jobs after filtering: {len(relevant)}")
 
-    if not relevant:
-        logger.info("No new relevant jobs found.")
-        save_seen(seen)
+    # ── Separate out empty-description jobs — don't score, don't mark seen ─────
+    no_desc:      list = []
+    to_score:     list = []
+    for job in relevant:
+        if not (job.get("description") or "").strip():
+            no_desc.append(job)
+        else:
+            to_score.append(job)
+
+    if no_desc:
+        logger.info(f"  {len(no_desc)} jobs have no description — skipping scoring, will retry next run")
+
+    if not to_score:
+        logger.info("No new relevant jobs with descriptions found.")
+        # Still print no-description list before returning
+        if no_desc:
+            print(f"\n{'='*60}")
+            print(f"NO DESCRIPTION — review manually ({len(no_desc)} jobs):")
+            print('='*60)
+            for j in sorted(no_desc, key=lambda x: x.get("title", "")):
+                co = j.get("company_name", j.get("company_slug", ""))
+                print(f"  {j.get('title','?')} @ {co}")
+                print(f"       └─ {j.get('url','')}")
+            print('='*60)
         return []
 
-    # ── Score and push ─────────────────────────────────────────────────────────
-    results: list[dict] = []
-    skipped: list[dict] = []
+    relevant = to_score
+
+    # ── Score and push (sequential — Claude API rate limits) ───────────────────
+    results:  list      = []
+    skipped:  list      = []
+    new_seen: List[str] = []
+
     for job in relevant:
         company = job.get("company_name", job.get("company_slug", ""))
         logger.info(f"Scoring: {job.get('title', '?')} @ {company}...")
         slug    = job.get("company_slug", "")
-        hc      = job.get("has_contact", False)
-        scoring = score_job(job, hc)
+        contacts = find_contacts(
+            job.get("company_name", ""), contact_norm_names, contact_rows,
+            slug=job.get("company_slug", ""), ats=job.get("ats", ""),
+        )
+        if contacts:
+            names = ", ".join(c.get("contact_name") or "?" for c in contacts)
+            logger.info(f"  Contact match ({len(contacts)}): {names}")
+        scoring = score_job(job, contacts)
 
-        # Apply priority boosts (additive on top of contact boost already in score_job)
-        if slug in high_slugs and slug not in contact_slugs:
+        # Apply watchlist priority boosts (on top of any contact boost from score_job)
+        if slug in high_slugs:
             scoring["score"] = min(100, scoring["score"] + HIGH_SCORE_BOOST)
         elif slug in watch_slugs:
             scoring["score"] = min(100, scoring["score"] + WATCH_SCORE_BOOST)
-        # Recalculate tier after boost
+
+        # Recalculate tier after boosts
         s = scoring["score"]
         scoring["tier"] = "A" if s >= 80 else "B" if s >= 60 else "C" if s >= 40 else "skip"
 
         is_priority = slug in always_surface
         if scoring["score"] < SCORE_THRESHOLD and not is_priority:
             logger.info(f"  Score {scoring['score']} below threshold — skipping")
-            seen[job["id"]] = datetime.now(timezone.utc).isoformat()
+            save_scored_job(sb, job, scoring, pushed_to_notion=False)
+            new_seen.append(job["id"])
             if dry_run:
                 skipped.append({"job": job, "scoring": scoring})
             time.sleep(1)
@@ -1188,16 +1290,18 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list[d
 
         if dry_run:
             print_job(job, scoring)
+            save_scored_job(sb, job, scoring, pushed_to_notion=False)
         else:
-            push_to_notion(job, scoring)
+            pushed = push_to_notion(job, scoring)
+            save_scored_job(sb, job, scoring, pushed_to_notion=pushed)
             if scoring.get("tier") == "A":
                 send_pushover(job, scoring)
 
-        seen[job["id"]] = datetime.now(timezone.utc).isoformat()
+        new_seen.append(job["id"])
         results.append({"job": job, "scoring": scoring})
         time.sleep(1)
 
-    # ── Dry-run: print skipped jobs summary ────────────────────────────────────
+    # ── Dry-run: print skipped summary ─────────────────────────────────────────
     if dry_run and skipped:
         print(f"\n{'='*60}")
         print(f"SKIPPED — below threshold ({len(skipped)} jobs):")
@@ -1211,23 +1315,34 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list[d
                 print(f"       └─ {top_gap}")
         print('='*60)
 
-    save_seen(seen)
-    logger.info(f"Done. {len(results)} jobs processed above threshold.")
+    # ── Print no-description jobs for manual review ────────────────────────────
+    if no_desc:
+        print(f"\n{'='*60}")
+        print(f"NO DESCRIPTION — review manually ({len(no_desc)} jobs):")
+        print('='*60)
+        for j in sorted(no_desc, key=lambda x: x.get("title", "")):
+            co = j.get("company_name", j.get("company_slug", ""))
+            print(f"  {j.get('title','?')} @ {co}")
+            print(f"       └─ {j.get('url','')}")
+        print('='*60)
+
+    save_seen(sb, new_seen)
+    logger.info(f"Done. {len(results)} jobs pushed above threshold | {len(no_desc)} need manual description review.")
     return results
+
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Job Scout — search-based job discovery for Dakota Rubin"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print results to terminal; don't push to Notion",
-    )
-    parser.add_argument(
-        "--hours", type=int, default=HOURS_LOOKBACK, metavar="N",
-        help=f"Look back N hours (default: {HOURS_LOOKBACK})",
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Job Scout — direct ATS polling and AI scoring")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print results to terminal, don't push to Notion")
+    parser.add_argument("--hours", type=int, default=HOURS_LOOKBACK, metavar="N",
+                        help=f"Only process jobs posted in the last N hours (default {HOURS_LOOKBACK}). "
+                             "Use a large value (e.g. 168) on first run to backfill.")
     args = parser.parse_args()
     run_scout(dry_run=args.dry_run, hours_back=args.hours)
+
+
+if __name__ == "__main__":
+    main()
