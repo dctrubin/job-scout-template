@@ -73,17 +73,33 @@ You'll run two SQL scripts that create the tables Job Scout needs. You do this i
 
 Repeat the same steps for `supabase_contacts_schema.sql`.
 
-> **What these scripts create:** A `companies` table (~26k rows after seeding), a `jobs` table where every scored job is stored, and a few helper views for analytics. Safe to run multiple times — they won't overwrite existing data.
+> **What these scripts create:**
+> - `supabase_jobs_schema.sql` → `companies` table (~26k rows after seeding) + `jobs` table + analytics views
+> - `supabase_contacts_schema.sql` → `company_watchlist` table (for VIP companies you want to prioritize) + `contacts` table (starts empty — for LinkedIn contacts, an advanced feature not covered in this guide)
+>
+> Both are safe to run multiple times — they won't overwrite existing data.
 
 ### 2c. Get your Supabase credentials
 
 You need two values from Supabase — save both for Step 7.
 
-1. In your Supabase project, click **Project Settings** (gear icon) → **API**
-2. Under **Project URL** — copy the URL that looks like `https://abcdefgh.supabase.co` → this is your **SUPABASE_URL**
-3. Under **Project API keys** → copy the **service_role** key (the longer one, not `anon`) → this is your **SUPABASE_KEY**
+**SUPABASE_URL:**
 
-> **Note:** Use the `service_role` key (not `anon`). It's the one that says "secret" next to it.
+Look at your browser's URL bar while you're in your Supabase project. It will show something like:
+`https://app.supabase.com/project/abcdefghijkl`
+
+Your SUPABASE_URL is that project ID turned into a hostname:
+`https://abcdefghijkl.supabase.co`
+
+Copy the project ID from the URL bar and put it in that format — that's your **SUPABASE_URL**.
+
+**SUPABASE_KEY:**
+
+1. In your Supabase project, click **Settings** (gear icon in the left sidebar) → **API Keys**
+2. Click the **Legacy anon, service_role API Keys** tab
+3. Under **service_role**, click **Reveal** → copy the key → this is your **SUPABASE_KEY**
+
+> Use the `service_role` key, not `anon`. It's the one labeled "secret".
 
 ---
 
@@ -93,7 +109,7 @@ Notion is where your scored jobs will appear. You'll duplicate a pre-built templ
 
 ### 3a. Duplicate the jobs database template
 
-Click the link below. It will open in Notion and show a **Duplicate** button in the top-right corner. Click it to add the database to your workspace.
+Click the link below. It will open in Notion. Look for the **duplicate icon** in the top-right corner — it looks like **two interlocking squares** (⧉). Click it to add the database to your workspace.
 
 **Jobs database:** [Open template →](https://dust-holiday-2a3.notion.site/329964e0b7f480748684d11ec9f1dde8?v=329964e0b7f48124bd1f000c7dc2cc4c&source=copy_link)
 
@@ -314,6 +330,32 @@ For example, to run at 7am and 5pm Central (CDT, summer):
 - cron: '45 12 * * *'   # 7:45am CDT = 12:45 UTC
 - cron: '52 22 * * *'   # 5:52pm CDT = 22:52 UTC
 ```
+
+---
+
+## Adding VIP companies to your watchlist *(optional)*
+
+The watchlist lets you flag companies you especially care about. Watchlisted companies get a score boost and always surface in your results regardless of score — useful for target companies you want to see even if a specific posting isn't a perfect match.
+
+To add a company:
+
+1. Go to your Supabase project → click **Table Editor** in the left sidebar
+2. Click on the **company_watchlist** table
+3. Click **Insert** → **Insert row**
+4. Fill in:
+   - `slug` — the company's ATS identifier (e.g. `stripe`, `notion`, `vercel`)
+   - `ats` — which platform they're on: `greenhouse`, `lever`, `ashby`, `bamboohr`, `workable`, or `breezy`
+   - `priority` — `watch` (+5 score boost) or `high` (+10 boost)
+   - `notes` — optional, just for your reference
+5. Click **Save**
+
+**Finding a company's slug:** Go to the ATS URL for a job you found at that company — the slug is the identifier in the URL path. Examples:
+- Greenhouse: `boards.greenhouse.io/SLUG/jobs/...`
+- Lever: `jobs.lever.co/SLUG/...`
+- Ashby: `jobs.ashbyhq.com/SLUG/...`
+- BambooHR: `SLUG.bamboohr.com/careers/...`
+
+The score boosts (`WATCH_SCORE_BOOST` and `HIGH_SCORE_BOOST`) are already set in `config.py` — no changes needed there.
 
 ---
 

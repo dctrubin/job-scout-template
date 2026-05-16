@@ -8,11 +8,17 @@
 
 # ─── TUNING ───────────────────────────────────────────────────────────────────
 
-HOURS_LOOKBACK      = 48   # how far back to look for jobs — used to limit scope on first run
-SCORE_THRESHOLD     = 60   # min score (0–100) to push to Notion — start here, raise if too noisy
-CONTACT_SCORE_BOOST = 10   # bonus points for companies where Has Contact = true in Notion
-WATCH_SCORE_BOOST   = 5    # bonus for Priority=Watch companies in Notion companies DB
-HIGH_SCORE_BOOST    = 10   # bonus for Priority=High companies in Notion companies DB
+HOURS_LOOKBACK  = 48   # how far back to look for jobs — 48h accounts for indexing lag
+SCORE_THRESHOLD = 60   # min score (0–100) to push to Notion — start here, raise if too noisy
+
+# Score boosts for companies you've added to your Supabase watchlist (see SETUP.md).
+# Watch = a company you care about; High = a company you really want to work at.
+WATCH_SCORE_BOOST = 5    # bonus for priority='watch' companies
+HIGH_SCORE_BOOST  = 10   # bonus for priority='high' companies
+
+# CONTACT_SCORE_BOOST — only used if you've imported LinkedIn contacts into Supabase.
+# Leave this commented out unless you've done that setup.
+# CONTACT_SCORE_BOOST = 10
 
 # ─── ROLE TITLES ──────────────────────────────────────────────────────────────
 #
