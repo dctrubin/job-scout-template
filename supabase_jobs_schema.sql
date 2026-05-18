@@ -1,8 +1,37 @@
--- ─── Job Scout — jobs table + analytics views ────────────────────────────────
+-- ─── Job Scout — core schema ──────────────────────────────────────────────────
 -- Run this in the Supabase SQL editor (Dashboard → SQL Editor → New query)
 -- Safe to run multiple times — all statements use IF NOT EXISTS / OR REPLACE.
 
--- ─── 1. Jobs table ────────────────────────────────────────────────────────────
+-- ─── 1. Companies table ───────────────────────────────────────────────────────
+-- Populated once by seed_companies.py (~26k rows). Refreshed monthly.
+
+CREATE TABLE IF NOT EXISTS companies (
+    id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug TEXT NOT NULL,
+    ats  TEXT NOT NULL,
+    UNIQUE (slug, ats)
+);
+
+CREATE INDEX IF NOT EXISTS idx_companies_slug_ats ON companies (slug, ats);
+CREATE INDEX IF NOT EXISTS idx_companies_ats      ON companies (ats);
+
+
+-- ─── 2. Dead slugs cache ──────────────────────────────────────────────────────
+-- ATS slugs that returned 404/no-jobs — cached for 30 days to skip on re-poll.
+
+CREATE TABLE IF NOT EXISTS dead_slugs (
+    id        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ats       TEXT        NOT NULL,
+    slug      TEXT        NOT NULL,
+    cached_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ats, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dead_slugs_ats_slug  ON dead_slugs (ats, slug);
+CREATE INDEX IF NOT EXISTS idx_dead_slugs_cached_at ON dead_slugs (cached_at DESC);
+
+
+-- ─── 3. Jobs table ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS jobs (
     id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -31,7 +60,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_scored_at ON jobs (scored_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_score     ON jobs (score DESC);
 
 
--- ─── 2. Company-level match stats ─────────────────────────────────────────────
+-- ─── 4. Company-level match stats ─────────────────────────────────────────────
 -- Answers: which companies keep posting relevant roles?
 
 CREATE OR REPLACE VIEW company_job_stats AS
@@ -56,7 +85,7 @@ JOIN jobs j ON j.company_slug = c.slug AND j.ats = c.ats
 GROUP BY c.slug, c.ats, c.priority, c.has_contact, c.contact_name, c.contact_role;
 
 
--- ─── 3. Contact research priority list ────────────────────────────────────────
+-- ─── 5. Contact research priority list ────────────────────────────────────────
 -- Companies with Tier A/B jobs but no contact yet — best ROI for outreach research
 
 CREATE OR REPLACE VIEW contact_research_priorities AS
@@ -76,7 +105,7 @@ WHERE has_contact = FALSE
 ORDER BY tier_a DESC, tier_b DESC, avg_score DESC;
 
 
--- ─── 4. Weekly search activity ────────────────────────────────────────────────
+-- ─── 6. Weekly search activity ────────────────────────────────────────────────
 -- Track search performance over time
 
 CREATE OR REPLACE VIEW weekly_search_stats AS
@@ -95,7 +124,7 @@ GROUP BY 1
 ORDER BY 1 DESC;
 
 
--- ─── 5. Score distribution by ATS platform ────────────────────────────────────
+-- ─── 7. Score distribution by ATS platform ────────────────────────────────────
 
 CREATE OR REPLACE VIEW platform_stats AS
 SELECT
@@ -134,3 +163,17 @@ ORDER BY total_matches DESC;
 -- GROUP BY company_slug, ats
 -- HAVING COUNT(*) >= 2
 -- ORDER BY appearances DESC, avg_score DESC;
+
+
+-- ─── 8. Data API grants ───────────────────────────────────────────────────────
+-- Required for new Supabase projects (created after May 30, 2026).
+-- Without these, PostgREST returns "42501" errors on all table access.
+-- Safe to run on existing projects — grants are idempotent.
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON companies        TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON jobs             TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dead_slugs       TO service_role;
+GRANT SELECT ON company_job_stats            TO service_role;
+GRANT SELECT ON contact_research_priorities  TO service_role;
+GRANT SELECT ON weekly_search_stats          TO service_role;
+GRANT SELECT ON platform_stats               TO service_role;

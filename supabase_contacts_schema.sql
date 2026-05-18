@@ -140,6 +140,17 @@ WHERE has_contact = FALSE
 ORDER BY tier_a DESC, tier_b DESC, avg_score DESC;
 
 
+-- ─── 4. Data API grants ───────────────────────────────────────────────────────
+-- Required for new Supabase projects (created after May 30, 2026).
+-- Safe to run on existing projects — grants are idempotent.
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON company_watchlist            TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON contacts                     TO service_role;
+-- Re-grant views replaced by this file:
+GRANT SELECT ON company_job_stats            TO service_role;
+GRANT SELECT ON contact_research_priorities  TO service_role;
+
+
 -- ─── Handy queries for the new tables ────────────────────────────────────────
 
 -- View all watchlist companies:
