@@ -74,10 +74,10 @@ You'll run two SQL scripts that create the tables Job Scout needs. You do this i
 Repeat the same steps for `supabase_contacts_schema.sql`.
 
 > **What these scripts create:**
-> - `supabase_jobs_schema.sql` → `companies` table (~26k rows after seeding) + `jobs` table + analytics views
-> - `supabase_contacts_schema.sql` → `company_watchlist` table (for VIP companies you want to prioritize) + `contacts` table (starts empty — for LinkedIn contacts, an advanced feature not covered in this guide)
+> - `supabase_jobs_schema.sql` → `companies` table (populated by the seed step) + `jobs` table + `dead_slugs` cache + analytics views
+> - `supabase_contacts_schema.sql` → `company_watchlist` table (for VIP companies you want to prioritize) + `contacts` table (starts empty — LinkedIn contacts are an advanced feature not covered in this guide)
 >
-> Both are safe to run multiple times — they won't overwrite existing data.
+> Both scripts also include explicit permission grants so the Job Scout code can access the tables. Both are safe to run multiple times — they won't overwrite existing data.
 
 ### 2c. Get your Supabase credentials
 
