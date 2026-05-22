@@ -83,19 +83,18 @@ Repeat the same steps for `supabase_contacts_schema.sql`.
 
 You need two values from Supabase — save both for Step 7.
 
+Both values are in the same place: click **Settings** (gear icon in the left sidebar) → **API**.
+
 **SUPABASE_URL:**
 
-Look at your browser's URL bar while you're in your Supabase project. It will show something like:
-`https://app.supabase.com/project/abcdefghijkl`
-
-Your SUPABASE_URL is that project ID turned into a hostname:
+Under **Project URL**, copy the URL shown — it looks like:
 `https://abcdefghijkl.supabase.co`
 
-Copy the project ID from the URL bar and put it in that format — that's your **SUPABASE_URL**.
+That's your **SUPABASE_URL**. Use exactly what Supabase shows here — do not copy the URL from your browser's address bar, which is a dashboard URL and won't work.
 
 **SUPABASE_KEY:**
 
-1. In your Supabase project, click **Settings** (gear icon in the left sidebar) → **API Keys**
+1. On the same Settings → API page, scroll down to **Project API Keys**
 2. Click the **Legacy anon, service_role API Keys** tab
 3. Under **service_role**, click **Reveal** → copy the key → this is your **SUPABASE_KEY**
 
