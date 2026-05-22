@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     top_matches      TEXT,                           -- pipe-joined match strings
     posted_at        DATE,
     scored_at        TIMESTAMPTZ DEFAULT NOW(),
-    pushed_to_notion BOOLEAN     DEFAULT FALSE,
+    last_seen_at     TIMESTAMPTZ DEFAULT NOW(),
+    pushed_to_notion BOOLEAN     DEFAULT FALSE
 
     -- No FK constraint — company_slug/ats are used for joins but not enforced,
     -- since some slugs are inferred from custom job URL domains and may differ
@@ -63,14 +64,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_score     ON jobs (score DESC);
 -- ─── 4. Company-level match stats ─────────────────────────────────────────────
 -- Answers: which companies keep posting relevant roles?
 
+-- Note: this is a baseline view. supabase_contacts_schema.sql replaces it with a
+-- richer version that joins company_watchlist and contacts.
 CREATE OR REPLACE VIEW company_job_stats AS
 SELECT
     c.slug,
     c.ats,
-    c.priority,
-    c.has_contact,
-    c.contact_name,
-    c.contact_role,
     COUNT(j.id)                                         AS total_matches,
     COUNT(CASE WHEN j.tier = 'A' THEN 1 END)            AS tier_a,
     COUNT(CASE WHEN j.tier = 'B' THEN 1 END)            AS tier_b,
@@ -78,21 +77,22 @@ SELECT
     COUNT(CASE WHEN j.tier = 'skip' THEN 1 END)         AS tier_skip,
     ROUND(AVG(j.score)::NUMERIC, 1)                     AS avg_score,
     MAX(j.score)                                        AS best_score,
-    MAX(j.scored_at)                                    AS last_seen,
+    MAX(j.last_seen_at)                                 AS last_seen,
     COUNT(CASE WHEN j.pushed_to_notion THEN 1 END)      AS notion_pushes
 FROM companies c
 JOIN jobs j ON j.company_slug = c.slug AND j.ats = c.ats
-GROUP BY c.slug, c.ats, c.priority, c.has_contact, c.contact_name, c.contact_role;
+GROUP BY c.slug, c.ats;
 
 
 -- ─── 5. Contact research priority list ────────────────────────────────────────
--- Companies with Tier A/B jobs but no contact yet — best ROI for outreach research
+-- Companies with Tier A/B jobs — best ROI for outreach research.
+-- Note: supabase_contacts_schema.sql replaces this with a version that also
+-- filters has_contact = FALSE once the contacts table exists.
 
 CREATE OR REPLACE VIEW contact_research_priorities AS
 SELECT
     slug,
     ats,
-    priority,
     total_matches,
     tier_a,
     tier_b,
@@ -100,8 +100,7 @@ SELECT
     best_score,
     last_seen
 FROM company_job_stats
-WHERE has_contact = FALSE
-  AND (tier_a > 0 OR (tier_b >= 2) OR (total_matches >= 3 AND avg_score >= 65))
+WHERE (tier_a > 0 OR (tier_b >= 2) OR (total_matches >= 3 AND avg_score >= 65))
 ORDER BY tier_a DESC, tier_b DESC, avg_score DESC;
 
 
