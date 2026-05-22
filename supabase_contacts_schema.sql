@@ -35,16 +35,24 @@ CREATE TABLE IF NOT EXISTS company_watchlist (
 
 CREATE INDEX IF NOT EXISTS idx_watchlist_slug_ats ON company_watchlist (slug, ats);
 
--- Migrate existing priority companies from the companies table.
--- Only inserts rows that don't already exist (safe to re-run).
-INSERT INTO company_watchlist (slug, ats, priority, notes)
-SELECT slug, ats, LOWER(priority), notes
-FROM companies
-WHERE LOWER(priority) IN ('watch', 'high')
-  AND NOT EXISTS (
-      SELECT 1 FROM company_watchlist cw
-      WHERE cw.slug = companies.slug AND cw.ats = companies.ats
-  );
+-- Migrate existing priority companies from the companies table (only if those
+-- columns exist — skipped automatically on fresh installs).
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'companies' AND column_name = 'priority'
+    ) THEN
+        INSERT INTO company_watchlist (slug, ats, priority, notes)
+        SELECT slug, ats, LOWER(priority), notes
+        FROM companies
+        WHERE LOWER(priority) IN ('watch', 'high')
+          AND NOT EXISTS (
+              SELECT 1 FROM company_watchlist cw
+              WHERE cw.slug = companies.slug AND cw.ats = companies.ats
+          );
+    END IF;
+END $$;
 
 
 -- ─── 2. Contacts ──────────────────────────────────────────────────────────────
@@ -70,27 +78,34 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE INDEX IF NOT EXISTS idx_contacts_slug_ats  ON contacts (slug, ats);
 CREATE INDEX IF NOT EXISTS idx_contacts_company   ON contacts (linkedin_company);
 
--- Migrate existing contacts from companies table.
--- Uses slug-derived name as linkedin_company since we don't have the original name.
--- These rows will be superseded when contacts are re-imported from the LinkedIn CSV.
-INSERT INTO contacts (linkedin_company, contact_name, contact_role, slug, ats, source)
-SELECT
-    INITCAP(REPLACE(REPLACE(slug, '-', ' '), '_', ' ')) AS linkedin_company,
-    contact_name,
-    contact_role,
-    slug,
-    ats,
-    'migrated_from_companies'
-FROM companies
-WHERE has_contact = TRUE
-  AND contact_name IS NOT NULL
-  AND contact_name <> ''
-  AND NOT EXISTS (
-      SELECT 1 FROM contacts ct
-      WHERE ct.slug = companies.slug
-        AND ct.ats  = companies.ats
-        AND ct.source = 'migrated_from_companies'
-  );
+-- Migrate existing contacts from companies table (only if those columns exist —
+-- skipped automatically on fresh installs).
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'companies' AND column_name = 'has_contact'
+    ) THEN
+        INSERT INTO contacts (linkedin_company, contact_name, contact_role, slug, ats, source)
+        SELECT
+            INITCAP(REPLACE(REPLACE(slug, '-', ' '), '_', ' ')) AS linkedin_company,
+            contact_name,
+            contact_role,
+            slug,
+            ats,
+            'migrated_from_companies'
+        FROM companies
+        WHERE has_contact = TRUE
+          AND contact_name IS NOT NULL
+          AND contact_name <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM contacts ct
+              WHERE ct.slug = companies.slug
+                AND ct.ats  = companies.ats
+                AND ct.source = 'migrated_from_companies'
+          );
+    END IF;
+END $$;
 
 
 -- ─── 3. Updated views ─────────────────────────────────────────────────────────
