@@ -49,11 +49,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     scored_at        TIMESTAMPTZ DEFAULT NOW(),
     last_seen_at     TIMESTAMPTZ DEFAULT NOW(),
     pushed_to_notion BOOLEAN     DEFAULT FALSE
-
-    -- No FK constraint — company_slug/ats are used for joins but not enforced,
-    -- since some slugs are inferred from custom job URL domains and may differ
-    -- slightly from the companies table slug.
 );
+-- No FK on company_slug/ats — some slugs are inferred from custom job URL domains
+-- and may differ slightly from the companies table slug.
 
 CREATE INDEX IF NOT EXISTS idx_jobs_company   ON jobs (company_slug, ats);
 CREATE INDEX IF NOT EXISTS idx_jobs_tier      ON jobs (tier);
