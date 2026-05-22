@@ -111,9 +111,12 @@ END $$;
 -- ─── 3. Updated views ─────────────────────────────────────────────────────────
 -- These replace the versions in supabase_jobs_schema.sql.
 -- Both now join to company_watchlist and contacts instead of reading from companies.
+-- DROP first so we can freely change column names/order (CREATE OR REPLACE can't).
 
--- Company-level match stats (updated to use new tables)
-CREATE OR REPLACE VIEW company_job_stats AS
+DROP VIEW IF EXISTS contact_research_priorities;
+DROP VIEW IF EXISTS company_job_stats;
+
+CREATE VIEW company_job_stats AS
 SELECT
     c.slug,
     c.ats,
@@ -128,7 +131,7 @@ SELECT
     COUNT(CASE WHEN j.tier = 'skip' THEN 1 END)         AS tier_skip,
     ROUND(AVG(j.score)::NUMERIC, 1)                     AS avg_score,
     MAX(j.score)                                        AS best_score,
-    MAX(j.scored_at)                                    AS last_seen,
+    MAX(j.last_seen_at)                                 AS last_seen,
     COUNT(CASE WHEN j.pushed_to_notion THEN 1 END)      AS notion_pushes
 FROM companies c
 LEFT JOIN company_watchlist w  ON w.slug = c.slug AND w.ats = c.ats
@@ -137,8 +140,7 @@ JOIN  jobs j                   ON j.company_slug = c.slug AND j.ats = c.ats
 GROUP BY c.slug, c.ats, w.priority;
 
 
--- Contact research priority list (updated — same logic, new source of has_contact)
-CREATE OR REPLACE VIEW contact_research_priorities AS
+CREATE VIEW contact_research_priorities AS
 SELECT
     slug,
     ats,
