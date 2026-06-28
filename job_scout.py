@@ -46,7 +46,7 @@ from config import (
     HOURS_LOOKBACK, SCORE_THRESHOLD, CONTACT_SCORE_BOOST,
     WATCH_SCORE_BOOST, HIGH_SCORE_BOOST,
     ROLE_TITLES, _TITLE_TERMS, _TITLE_QUALIFIERS,
-    HARD_FILTERS, SCORING_RULES,
+    HARD_FILTERS, SCORING_RULES, TARGET_CITY,
 )
 
 _profile_path = pathlib.Path(__file__).parent / "profile.md"
@@ -658,8 +658,9 @@ def passes_hard_filters(job: dict) -> bool:
         if kw.lower() in title_lower:
             return False
 
-    if HARD_FILTERS["require_remote_or_austin"]:
+    if HARD_FILTERS["require_remote_or_city"]:
         loc        = (job.get("location") or "").lower()
+        target_city = (TARGET_CITY or "").strip().lower()
         desc_start = (job.get("description") or "")[:500].lower()
 
         non_us_countries = (
@@ -677,7 +678,7 @@ def passes_hard_filters(job: dict) -> bool:
         location_ok = (
             not loc
             or "remote" in loc
-            or "austin" in loc
+            or (target_city and target_city in loc)
             or "anywhere" in loc
             or "united states" in loc
             or loc in ("us", "usa", "u.s.", "u.s.a.")

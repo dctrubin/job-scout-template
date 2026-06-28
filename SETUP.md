@@ -239,13 +239,17 @@ To turn path B off entirely and rely only on `ROLE_TITLES`, leave one set empty:
 
 > **Sanity check:** every title under **Target Role Titles** in your `profile.md` should pass either path A or path B above. If it wouldn't, add it to `ROLE_TITLES`.
 
-**`require_remote_or_austin`** — This defaults to `True`, which means only remote / US-wide jobs or jobs in **Austin, TX** will pass. The target city is currently hardcoded to "austin". If you're elsewhere:
+**`TARGET_CITY`** — Your home city, lowercase. On-site jobs in this city pass the location gate alongside remote / US-wide roles. Set it to where you live:
 
 ```python
-"require_remote_or_austin": False,   # removes the location gate entirely
+TARGET_CITY = "denver"   # defaults to "austin"
 ```
 
-Or, to keep a location gate for *your* city, edit the `"austin"` check in `job_scout.py` (the `passes_hard_filters` function) to your city name.
+**`require_remote_or_city`** — The location gate, `True` by default: only remote / US-wide jobs or jobs in your `TARGET_CITY` pass. If you're open to a job anywhere, turn it off:
+
+```python
+"require_remote_or_city": False,   # removes the location gate entirely
+```
 
 **`CONTACT_SCORE_BOOST`** — You can ignore this. It only does anything if you import LinkedIn contacts (an advanced feature this guide doesn't cover). Leave it as-is; the contacts table starts empty, so it has no effect.
 

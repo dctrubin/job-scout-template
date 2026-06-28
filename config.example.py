@@ -86,7 +86,12 @@ _TITLE_QUALIFIERS = {"revenue", "customer success", "business", "gtm",
 # Jobs matching any of these are dropped before scoring — saves Claude API calls.
 # exclude_keywords: substrings matched against the job title (case-insensitive)
 # exclude_company_slugs: ATS slugs of aggregator boards or companies to skip
-# require_remote_or_austin: the location gate (see note below)
+# require_remote_or_city: the location gate (see note below)
+
+# Your home city for the location gate, lowercase (e.g. "austin", "denver",
+# "new york"). On-site jobs in this city pass the gate alongside remote/US-wide
+# roles. Matched as a substring against each job's location.
+TARGET_CITY = "austin"
 
 HARD_FILTERS = {
     "exclude_keywords": [
@@ -96,12 +101,10 @@ HARD_FILTERS = {
     "exclude_company_slugs": {
         "jobgether", "remotar", "arc", "wellfound", "smartrecruiters",
     },
-    # Location gate. When True, a job is kept only if it's remote/US-wide OR in
-    # the target city. HEADS UP: the city is hardcoded to "austin" in
-    # job_scout.py (passes_hard_filters). If you live elsewhere and want on-site
-    # local jobs, either set this to False to drop the location gate entirely, or
-    # change the "austin" check in job_scout.py to your city.
-    "require_remote_or_austin": True,
+    # Location gate. When True, a job is kept only if it's remote/US-wide OR
+    # located in TARGET_CITY (set above). Set to False to drop the location gate
+    # entirely and accept jobs anywhere.
+    "require_remote_or_city": True,
 }
 
 # ─── SCORING RULES ────────────────────────────────────────────────────────────
