@@ -6,6 +6,22 @@ Job Scout automatically finds and scores job postings twice a day and organizes 
 
 ---
 
+## The big picture
+
+Before the step-by-step, here's the whole thing at a glance so nothing feels out of nowhere:
+
+1. **Make accounts** and a private copy of this repo (Steps 1)
+2. **Set up the database** in Supabase — paste one SQL script (Step 2)
+3. **Set up Notion** — duplicate a template and connect it (Step 3)
+4. **Grab your keys** from Anthropic (and optionally Pushover) (Step 4)
+5. **Create two things that describe you:** your `profile.md` (résumé/targets, added as a secret) and your `config.py` (job titles, location, filters) (Steps 5–6)
+6. **Paste all your keys into GitHub** as secrets (Step 7)
+7. **Seed companies**, then **run it** — both are single button clicks (Steps 8–9)
+
+After that it runs on its own, twice a day. You don't install anything or touch a terminal.
+
+---
+
 ## Before you begin — accounts to create
 
 You need accounts on 4 services (5 if you want phone alerts). Create all of them before starting the steps below — it's faster than switching back and forth mid-setup.
@@ -56,28 +72,22 @@ Supabase is a free database service. Job Scout uses it to store the list of ~26,
 5. Set a database password — save it somewhere, but you won't need it again
 6. Click **Create new project** and wait ~1 minute for it to finish
 
-### 2b. Run the database setup scripts
+### 2b. Run the database setup script
 
-You'll run two SQL scripts that create the tables Job Scout needs. You do this in Supabase's built-in SQL editor — no coding required.
-
-**First script (`supabase_jobs_schema.sql`):**
+You'll run one SQL script that creates all the tables Job Scout needs. You do this in Supabase's built-in SQL editor — no coding required.
 
 1. In your Supabase project, click **SQL Editor** in the left sidebar
 2. Click **New query**
-3. Go back to your GitHub repo → open `supabase_jobs_schema.sql` → click the **Copy raw file** button (clipboard icon)
+3. Go back to your GitHub repo → open `supabase_setup.sql` → click the **Copy raw file** button (clipboard icon)
 4. Paste the contents into the Supabase SQL editor
 5. Click **Run** (or press Cmd+Enter / Ctrl+Enter)
 6. You should see "Success. No rows returned."
 
-**Second script (`supabase_contacts_schema.sql`):**
-
-Repeat the same steps for `supabase_contacts_schema.sql`.
-
-> **What these scripts create:**
-> - `supabase_jobs_schema.sql` → `companies` table (populated by the seed step) + `jobs` table + `dead_slugs` cache + analytics views
-> - `supabase_contacts_schema.sql` → `company_watchlist` table (for VIP companies you want to prioritize) + `contacts` table (starts empty — LinkedIn contacts are an advanced feature not covered in this guide)
+> **What this script creates:**
+> - `companies` table (populated by the seed step) + `jobs` table + `dead_slugs` cache + analytics views
+> - `company_watchlist` table (for VIP companies you want to prioritize) + `contacts` table (starts empty — LinkedIn contacts are an advanced feature not covered in this guide)
 >
-> Both scripts also include explicit permission grants so the Job Scout code can access the tables. Both are safe to run multiple times — they won't overwrite existing data.
+> It also includes the permission grants the Job Scout code needs. Safe to run more than once — it won't overwrite existing data.
 
 ### 2c. Get your Supabase credentials
 
@@ -211,6 +221,8 @@ This file controls which job titles to look for, which locations to accept, and 
 3. Go to `config.example.py` in your repo → copy its entire contents
 4. Paste into the new file
 5. Make these changes:
+
+> ⚠️ **Editing tip:** Only change the text *inside* the quotes and brackets. Don't delete the quotes, commas, brackets, or any setting lines — a single missing comma or quote will stop the run. If a run later fails with an `ImportError`, just re-copy `config.example.py` and re-enter your values.
 
 A job title passes the filter if **either** of these is true:
 **(A)** it contains one of your `ROLE_TITLES`, **or** **(B)** it contains a word from `_TITLE_TERMS` *and* a word from `_TITLE_QUALIFIERS`. Set up both paths for your field.

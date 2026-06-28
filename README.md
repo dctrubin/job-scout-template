@@ -73,7 +73,6 @@ Every job that scores 60+ lands in your Notion database with:
 | `seed_companies.py` | One-time setup — loads ~26k companies into Supabase |
 | `config.example.py` | Template for your personal settings (copy to `config.py`) |
 | `profile.example.md` | Template for your candidate profile (goes in as a GitHub secret) |
-| `supabase_jobs_schema.sql` | Database schema — run once in Supabase SQL editor |
-| `supabase_contacts_schema.sql` | Contacts/watchlist schema — run once in Supabase SQL editor |
+| `supabase_setup.sql` | Complete database schema — paste once into the Supabase SQL editor |
 | `.github/workflows/job_scout.yml` | Automated daily runs |
 | `.github/workflows/seed_companies.yml` | One-time seed trigger (run manually from GitHub) |

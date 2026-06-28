@@ -92,7 +92,7 @@ someone else's playbook. Manager or IC-with-influence roles preferred over pure 
      You can also add hard SCORING_RULES in config.py for patterns you want
      to always cap regardless of other factors. -->
 
-- On-site requirement outside of Austin, TX (remote or Austin hybrid only)
+- On-site requirement outside my home city (remote or local hybrid only)
 - Roles that are primarily spreadsheet maintenance or data entry
 - Companies in active financial distress or with known layoff rounds in progress
 - Titles with "coordinator" or "specialist" — I'm past that level
