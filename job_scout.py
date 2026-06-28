@@ -45,7 +45,7 @@ SUPABASE_KEY       = os.environ.get("SUPABASE_KEY", "")
 from config import (
     HOURS_LOOKBACK, SCORE_THRESHOLD, CONTACT_SCORE_BOOST,
     WATCH_SCORE_BOOST, HIGH_SCORE_BOOST,
-    ROLE_TITLES, _OPS_TERMS, _DOMAIN_QUALS,
+    ROLE_TITLES, _TITLE_TERMS, _TITLE_QUALIFIERS,
     HARD_FILTERS, SCORING_RULES,
 )
 
@@ -634,9 +634,9 @@ def is_relevant_title(title: str) -> bool:
     t = title.lower()
     if any(rt.lower() in t for rt in ROLE_TITLES):
         return True
-    has_ops       = any(kw in t for kw in _OPS_TERMS)
-    has_qualifier = any(q in t for q in _DOMAIN_QUALS)
-    return has_ops and has_qualifier
+    has_term      = any(kw in t for kw in _TITLE_TERMS)
+    has_qualifier = any(q in t for q in _TITLE_QUALIFIERS)
+    return has_term and has_qualifier
 
 
 def is_within_lookback(posted_at: str, hours: int) -> bool:

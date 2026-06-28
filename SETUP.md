@@ -199,13 +199,23 @@ Your profile is stored as a GitHub secret (not a file in your repo). This keeps 
 
 This file controls which job titles to look for, which locations to accept, and a few other filters.
 
+> **How filtering works — two stages (important).**
+> Job Scout filters in two stages, and you have to set up **both**:
+> 1. **The title filter** (`config.py`, this step) is a cheap keyword gate that runs *before* the AI. It decides which jobs are even **looked at**. If a job's title doesn't pass this gate, Claude never scores it and it can never reach Notion.
+> 2. **Scoring** (your `profile.md` from Step 5) only rates the jobs that already **passed** the title filter.
+>
+> The most common setup mistake is writing a great profile for your field but leaving the title keywords on their defaults (tuned for revenue/sales operations). When that happens you get a feed full of ops jobs that don't match you, and your real target titles never show up. **The keywords here and your Target Role Titles in `profile.md` must describe the same kind of role.**
+
 1. In your GitHub repo, click **Add file** → **Create new file**
 2. Name the file `config.py` (exactly — lowercase, with `.py`)
 3. Go to `config.example.py` in your repo → copy its entire contents
 4. Paste into the new file
 5. Make these changes:
 
-**`ROLE_TITLES`** — Replace the placeholder titles with the titles you're actually looking for:
+A job title passes the filter if **either** of these is true:
+**(A)** it contains one of your `ROLE_TITLES`, **or** **(B)** it contains a word from `_TITLE_TERMS` *and* a word from `_TITLE_QUALIFIERS`. Set up both paths for your field.
+
+**`ROLE_TITLES`** (path A) — Replace the example titles with the exact titles you're looking for. These are plain substring matches, so `"Product Manager"` also catches `"Senior Product Manager"`:
 
 ```python
 ROLE_TITLES = [
@@ -218,11 +228,26 @@ ROLE_TITLES = [
 
 List any title that should automatically pass the filter. No limit on how many.
 
-**`require_remote_or_austin`** — This defaults to `True`, which means only remote jobs or jobs in Austin, TX will pass. If you're in a different city or open to any location, change it:
+**`_TITLE_TERMS` + `_TITLE_QUALIFIERS`** (path B) — A compound match that catches titles your list didn't anticipate (e.g. "Growth Strategy Lead"). A title passes only if it contains a word from **both** sets. **These default to operations/revenue words — if your field is different, change them, or path B will keep surfacing ops jobs you don't want.** For example, a product manager might use:
+
+```python
+_TITLE_TERMS      = {"manager", "lead", "owner"}
+_TITLE_QUALIFIERS = {"product", "platform", "growth"}
+```
+
+To turn path B off entirely and rely only on `ROLE_TITLES`, leave one set empty: `_TITLE_QUALIFIERS = set()`.
+
+> **Sanity check:** every title under **Target Role Titles** in your `profile.md` should pass either path A or path B above. If it wouldn't, add it to `ROLE_TITLES`.
+
+**`require_remote_or_austin`** — This defaults to `True`, which means only remote / US-wide jobs or jobs in **Austin, TX** will pass. The target city is currently hardcoded to "austin". If you're elsewhere:
 
 ```python
 "require_remote_or_austin": False,   # removes the location gate entirely
 ```
+
+Or, to keep a location gate for *your* city, edit the `"austin"` check in `job_scout.py` (the `passes_hard_filters` function) to your city name.
+
+**`CONTACT_SCORE_BOOST`** — You can ignore this. It only does anything if you import LinkedIn contacts (an advanced feature this guide doesn't cover). Leave it as-is; the contacts table starts empty, so it has no effect.
 
 6. When done, scroll down and click **Commit changes** → **Commit changes**
 
@@ -285,7 +310,7 @@ The automation runs automatically at ~4:45am and ~3:52pm Central Time every day.
 - If any jobs scored 80+ and you set up Pushover, you'll get a phone notification
 
 **If nothing appears in Notion after a successful run:**
-Your `ROLE_TITLES` in `config.py` may not be matching any job titles on the platforms, or all matches scored below 60. Check the run logs — look for lines starting with `[TITLE MATCH]` to see what's passing the filter.
+Nothing is passing the title filter, or everything scored below your threshold. Check the run logs for `[TITLE MATCH]` lines — if you see none, broaden your `ROLE_TITLES` or `_TITLE_TERMS`/`_TITLE_QUALIFIERS` for your field (see Step 6). See Troubleshooting for more.
 
 ---
 
@@ -361,11 +386,13 @@ The score boosts (`WATCH_SCORE_BOOST` and `HIGH_SCORE_BOOST`) are already set in
 
 ## Troubleshooting
 
-**Run fails immediately** → Check that all secrets are added correctly (Step 7). Secret names are case-sensitive and must match exactly.
+**Run fails immediately** → Check that all secrets are added correctly (Step 7). Secret names are case-sensitive and must match exactly. If the logs show an `ImportError` or `cannot import name ...`, your `config.py` is missing a setting — start from a fresh copy of `config.example.py` and only change the values, don't delete any lines.
 
 **"Supabase error" or similar database error** → Double-check `SUPABASE_URL` and `SUPABASE_KEY`. Make sure you used the `service_role` key, not `anon`.
 
-**No jobs appear in Notion after a successful run** → Check the run logs for `[TITLE MATCH]` lines. If you see none, your `ROLE_TITLES` aren't matching any job titles. Try adding more general titles (e.g. "Operations Manager"), or check for typos.
+**No jobs appear in Notion after a successful run** → Check the run logs for `[TITLE MATCH]` lines. If you see none, nothing is passing the title filter — your `ROLE_TITLES` and your `_TITLE_TERMS`/`_TITLE_QUALIFIERS` sets aren't matching any job titles. Add more general titles, broaden the keyword sets to your field, or check for typos. If you *do* see matches but nothing reached Notion, they all scored below `SCORE_THRESHOLD`.
+
+**My feed is full of jobs from the wrong field** → You updated `profile.md` but left the title keywords on the defaults. The `_TITLE_TERMS`/`_TITLE_QUALIFIERS` sets in `config.py` ship tuned for revenue/sales operations; edit them to match your field (or set one to `set()` to disable that path). See Step 6.
 
 **"Notion push error"** → Make sure you connected the Notion integration to your Jobs database (Step 3c). The integration must be connected individually to the database, not just the workspace.
 
