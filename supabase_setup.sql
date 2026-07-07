@@ -77,7 +77,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_score     ON jobs (score DESC);
 
 -- Note: this is a baseline view. Part 2 below replaces it with a
 -- richer version that joins company_watchlist and contacts.
-CREATE OR REPLACE VIEW company_job_stats AS
+-- DROP first (not CREATE OR REPLACE) so a re-run doesn't hit error 42P16:
+-- once Part 2 has run, this view already exists with MORE columns, and
+-- CREATE OR REPLACE is not allowed to drop columns from an existing view.
+-- CASCADE also clears contact_research_priorities, which depends on this view.
+DROP VIEW IF EXISTS company_job_stats CASCADE;
+CREATE VIEW company_job_stats AS
 SELECT
     c.slug,
     c.ats,
@@ -100,7 +105,8 @@ GROUP BY c.slug, c.ats;
 -- Note: Part 2 below replaces this with a version that also
 -- filters has_contact = FALSE once the contacts table exists.
 
-CREATE OR REPLACE VIEW contact_research_priorities AS
+DROP VIEW IF EXISTS contact_research_priorities;
+CREATE VIEW contact_research_priorities AS
 SELECT
     slug,
     ats,
