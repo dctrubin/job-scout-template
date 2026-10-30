@@ -71,6 +71,14 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tier      ON jobs (tier);
 CREATE INDEX IF NOT EXISTS idx_jobs_scored_at ON jobs (scored_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_score     ON jobs (score DESC);
 
+-- Salary (parsed from the posting) and Claude's label for the role's real
+-- function. Added Oct 2026 — safe to re-run on an existing database.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_min       INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_max       INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_mid       INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS team_function    TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS function_flagged BOOLEAN DEFAULT FALSE;
+
 
 -- ─── 4. Company-level match stats ─────────────────────────────────────────────
 -- Answers: which companies keep posting relevant roles?
@@ -383,3 +391,27 @@ GRANT SELECT ON contact_research_priorities  TO service_role;
 -- INSERT INTO company_watchlist (slug, ats, priority, notes)
 -- VALUES ('acme-corp', 'greenhouse', 'high', 'Strong ops team, talked to recruiter')
 -- ON CONFLICT (slug, ats) DO UPDATE SET priority = EXCLUDED.priority, notes = EXCLUDED.notes;
+
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- Security — keep this section LAST
+--
+-- Turns on Row Level Security with no policies, which blocks Supabase's public
+-- "anon" key from reading or changing anything. Job Scout uses the service_role
+-- key, which bypasses RLS, so nothing else changes. The views are switched to
+-- run with the caller's permissions so they can't be used to read around RLS.
+-- Afterwards, Supabase → Advisors → Security Advisor should show no errors.
+-- ════════════════════════════════════════════════════════════════════════════
+
+ALTER TABLE companies         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dead_slugs        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE jobs              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE company_watchlist ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contacts          ENABLE ROW LEVEL SECURITY;
+
+ALTER VIEW IF EXISTS company_job_stats           SET (security_invoker = true);
+ALTER VIEW IF EXISTS contact_research_priorities SET (security_invoker = true);
+ALTER VIEW IF EXISTS weekly_search_stats         SET (security_invoker = true);
+ALTER VIEW IF EXISTS platform_stats              SET (security_invoker = true);
+
+REVOKE ALL ON companies, dead_slugs, jobs, company_watchlist, contacts FROM anon, authenticated;

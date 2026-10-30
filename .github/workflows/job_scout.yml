@@ -6,9 +6,21 @@ on:
     - cron: '52 21 * * *'   # ~3:52pm CST (4:52pm CDT)
   workflow_dispatch:        # allow manual runs from the Actions tab
 
+# The job only reads the repo; everything else uses its own API keys.
+permissions:
+  contents: read
+
+# Never let two runs overlap (e.g. a delayed scheduled run + a manual one).
+concurrency:
+  group: job-scout
+  cancel-in-progress: false
+
 jobs:
   scout:
+    # Skip in the public template repo itself — runs only in your own copy.
+    if: github.repository != 'dctrubin/job-scout-template'
     runs-on: ubuntu-latest
+    timeout-minutes: 180    # a hung run would otherwise burn up to 6 hours of minutes
 
     steps:
       - name: Check out repo
@@ -18,12 +30,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-job-scout-v2
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -31,7 +38,7 @@ jobs:
       - name: Write candidate profile
         env:
           CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
-        run: echo "$CANDIDATE_PROFILE" > profile.md
+        run: printf '%s\n' "$CANDIDATE_PROFILE" > profile.md
 
       - name: Run Job Scout
         env:

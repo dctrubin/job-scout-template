@@ -4,5 +4,8 @@ __pycache__/
 *.pyo
 .env
 .DS_Store
-config.py
 profile.md
+.env.*
+*.csv
+
+# config.py is NOT ignored: your private repo must commit it so GitHub Actions can run.

@@ -74,5 +74,14 @@ Every job that scores 60+ lands in your Notion database with:
 | `config.example.py` | Template for your personal settings (copy to `config.py`) |
 | `profile.example.md` | Template for your candidate profile (goes in as a GitHub secret) |
 | `supabase_setup.sql` | Complete database schema — paste once into the Supabase SQL editor |
+| `salary.py` | Reads salary ranges from postings; optional pre-filter before Claude |
+| `gates.py` | Optional flag for jobs whose real function is outside your target (e.g. Finance) |
 | `.github/workflows/job_scout.yml` | Automated daily runs |
-| `.github/workflows/seed_companies.yml` | One-time seed trigger (run manually from GitHub) |
+| `.github/workflows/seed_companies.yml` | Loads companies — run once at setup, then refreshes monthly on its own |
+
+---
+
+## Credits & License
+
+- Company lists come from [Feashliaa/job-board-aggregator](https://github.com/Feashliaa/job-board-aggregator), licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). That allows personal, non-commercial use, which is what Job Scout is for. Don't use the seeded company data in a commercial product.
+- Job Scout's own code is MIT-licensed. See [LICENSE](LICENSE).

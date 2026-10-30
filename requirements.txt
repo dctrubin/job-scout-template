@@ -1,6 +1,8 @@
-requests
-anthropic
-beautifulsoup4
-lxml
-supabase
-rapidfuzz
+# Pinned so a surprise upstream release can't break (or compromise) scheduled runs.
+# To upgrade: bump a version here, run `python3 job_scout.py --dry-run` once, then commit.
+anthropic==2.3.0
+supabase==2.33.0
+requests==2.34.2
+beautifulsoup4==4.15.0
+lxml==6.1.3
+rapidfuzz==3.14.6

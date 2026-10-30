@@ -1,11 +1,23 @@
 name: Seed Companies
 
 on:
-  workflow_dispatch:    # manual trigger only — run this once during setup
+  schedule:
+    - cron: '17 8 1 * *'    # monthly, 1st of the month — picks up newly listed companies
+  workflow_dispatch:         # or run it any time from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seed-companies
+  cancel-in-progress: false
 
 jobs:
   seed:
+    # Skip in the public template repo itself — runs only in your own copy.
+    if: github.repository != 'dctrubin/job-scout-template'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Check out repo
@@ -15,16 +27,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-job-scout-v2
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Adds new slugs only; existing companies (and their dead-slug history) are untouched.
       - name: Seed companies into Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

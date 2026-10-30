@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Job Scout — Direct ATS polling and AI scoring for Dakota Rubin
+Job Scout — Direct ATS polling and AI scoring
 
 Discovery flow:
-  1. Load all companies from Supabase (38k companies, VIP flags included)
+  1. Load all companies from Supabase
   2. Poll each company's ATS API in parallel for all open jobs
   3. Filter by title → check seen cache → hard filters
   4. Score new matches with Claude → push to Notion → Pushover alert (Tier A)
@@ -13,6 +13,7 @@ No search API required. Operational data (seen jobs, dead slugs) persists in Sup
 """
 
 import os
+import sys
 import json
 import time
 import logging
@@ -42,18 +43,32 @@ PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "")
 SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY       = os.environ.get("SUPABASE_KEY", "")
 
+import config as _config
 from config import (
     HOURS_LOOKBACK, SCORE_THRESHOLD, CONTACT_SCORE_BOOST,
     WATCH_SCORE_BOOST, HIGH_SCORE_BOOST,
     ROLE_TITLES, _TITLE_TERMS, _TITLE_QUALIFIERS,
     HARD_FILTERS, SCORING_RULES, TARGET_CITY,
 )
+from salary import parse_salary, passes_salary_gate, SALARY_FLOOR_BASE
+from gates import function_gate_reason
+
+# Optional settings — older config.py files without these keep working.
+CLAUDE_MODEL  = getattr(_config, "CLAUDE_MODEL", "claude-sonnet-5-5")
+CLAUDE_EFFORT = getattr(_config, "CLAUDE_EFFORT", "low")
+
+# Stop scoring after this many Claude failures in a row — almost always a bad
+# key, retired model, or empty credit balance rather than a one-off blip.
+MAX_CONSECUTIVE_SCORING_FAILURES = 3
 
 _profile_path = pathlib.Path(__file__).parent / "profile.md"
 if not _profile_path.exists():
     print("Setup required: profile.md not found. Copy profile.example.md to profile.md and fill in your details.")
-    raise SystemExit(0)
+    raise SystemExit(1)
 CANDIDATE_PROFILE = _profile_path.read_text()
+if not CANDIDATE_PROFILE.strip():
+    print("profile.md is empty — check that the CANDIDATE_PROFILE GitHub secret is set.")
+    raise SystemExit(1)
 
 _DIR            = os.path.dirname(os.path.abspath(__file__))
 SEEN_JOBS_FILE  = os.path.join(_DIR, ".seen_jobs.json")   # fallback if Supabase not configured
@@ -76,6 +91,23 @@ def _get_supabase() -> Optional[Client]:
     if SUPABASE_URL and SUPABASE_KEY:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
     return None
+
+
+def _select_all(build_query, page_size: int = 1000) -> list:
+    """
+    Run a Supabase select across every page of results.
+    Supabase caps each response at 1,000 rows, so a single .execute() silently
+    drops everything past that. build_query() must return a fresh query builder
+    with a stable .order() so pages don't overlap or skip rows.
+    """
+    rows: list = []
+    offset = 0
+    while True:
+        page = build_query().range(offset, offset + page_size - 1).execute().data or []
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        offset += page_size
 
 # ─── UTILITIES ────────────────────────────────────────────────────────────────
 
@@ -133,39 +165,24 @@ def load_companies_from_supabase(sb: Client) -> list:
     """
     Load all companies from Supabase. Returns list of company dicts with
     the same shape used throughout the rest of the script.
-    Paginates 1000 rows at a time (Supabase default max).
     """
+    try:
+        rows = _select_all(lambda: sb.table("companies").select("slug, ats").order("ats").order("slug"))
+    except Exception as e:
+        logger.error(f"Failed to load companies from Supabase: {e}")
+        return []
+
     companies = []
-    offset    = 0
-    page_size = 1000
-
-    while True:
-        try:
-            result = (
-                sb.table("companies")
-                .select("slug, ats")
-                .range(offset, offset + page_size - 1)
-                .execute()
-            )
-        except Exception as e:
-            logger.error(f"Failed to load companies from Supabase: {e}")
-            return []
-
-        rows = result.data or []
-        for row in rows:
-            slug = (row.get("slug") or "").strip()
-            ats  = (row.get("ats")  or "").strip().lower()
-            if not slug or not ats:
-                continue
-            companies.append({
-                "slug": slug,
-                "ats":  ats,
-                "name": slug.replace("-", " ").replace("_", " ").title(),
-            })
-
-        if len(rows) < page_size:
-            break
-        offset += page_size
+    for row in rows:
+        slug = (row.get("slug") or "").strip()
+        ats  = (row.get("ats")  or "").strip().lower()
+        if not slug or not ats:
+            continue
+        companies.append({
+            "slug": slug,
+            "ats":  ats,
+            "name": slug_to_name(slug),
+        })
 
     logger.info(f"Loaded {len(companies)} companies from Supabase")
     return companies
@@ -185,13 +202,15 @@ def load_watchlist(sb: Client) -> Dict[Tuple[str, str], dict]:
     Returns dict keyed by (slug, ats) → {'priority': 'watch'|'high', 'notes': str}.
     """
     try:
-        result = sb.table("company_watchlist").select("slug, ats, priority, notes").execute()
+        rows = _select_all(
+            lambda: sb.table("company_watchlist").select("slug, ats, priority, notes").order("ats").order("slug")
+        )
         return {
             (row["slug"], row["ats"]): {
                 "priority": (row.get("priority") or "watch").lower(),
                 "notes":    row.get("notes") or "",
             }
-            for row in (result.data or [])
+            for row in rows
         }
     except Exception as e:
         logger.warning(f"Failed to load watchlist from Supabase: {e}")
@@ -208,10 +227,11 @@ def load_contacts_index(sb: Client) -> Tuple[List[str], List[dict]]:
     At scoring time, match job.company_name against norm_names to find a connection.
     """
     try:
-        result = sb.table("contacts").select(
-            "id, slug, ats, linkedin_company, contact_name, contact_role, linkedin_url"
-        ).execute()
-        rows = result.data or []
+        rows = _select_all(
+            lambda: sb.table("contacts")
+            .select("id, slug, ats, linkedin_company, contact_name, contact_role, linkedin_url")
+            .order("id")
+        )
         norm_names = [normalize_company(row.get("linkedin_company") or "") for row in rows]
         return norm_names, rows
     except Exception as e:
@@ -516,6 +536,26 @@ def poll_workable(company: dict):
 
 # ─── BAMBOOHR ─────────────────────────────────────────────────────────────────
 
+def _bamboohr_location(obj: dict) -> str:
+    """BambooHR has two posting shapes: older ones carry city/state in 'location',
+    newer ones (locationType '1') leave that null and use 'atsLocation' instead."""
+    loc = obj.get("location")
+    if isinstance(loc, str) and loc.strip():
+        return loc.strip()
+    if isinstance(loc, dict):
+        text = ", ".join(p for p in (loc.get("city"), loc.get("state")) if p)
+        if text:
+            return text
+    ats = obj.get("atsLocation")
+    if isinstance(ats, dict):
+        text = ", ".join(p for p in (ats.get("city"), ats.get("state") or ats.get("province")) if p)
+        if text:
+            return text
+        if ats.get("country"):
+            return ats["country"]
+    return ""
+
+
 def poll_bamboohr(company: dict):
     """
     Fetch job stubs from BambooHR careers list.
@@ -539,11 +579,7 @@ def poll_bamboohr(company: dict):
             return _DEAD
         stubs = []
         for job in resp.json().get("result", []):
-            loc = job.get("location") or {}
-            if isinstance(loc, dict):
-                location = ", ".join(filter(None, [loc.get("city", ""), loc.get("state", "")]))
-            else:
-                location = str(loc) if loc else ""
+            location = _bamboohr_location(job)
             job_id = str(job.get("id", ""))
             stubs.append({
                 "id":           f"bhr_{job_id}",
@@ -582,7 +618,7 @@ def fetch_bamboohr_job(stub: dict) -> Optional[dict]:
         for selector in ["div.BambooRich", "[data-testid='Prose']", "div.description", "div#app main", "main"]:
             el = soup.select_one(selector)
             if el:
-                desc = el.get_text(separator=" ", strip=True)[:4000]
+                desc = el.get_text(separator=" ", strip=True)
                 break
         job = dict(stub)
         job["description"] = desc
@@ -659,8 +695,8 @@ def passes_hard_filters(job: dict) -> bool:
             return False
 
     if HARD_FILTERS["require_remote_or_city"]:
-        loc        = (job.get("location") or "").lower()
         target_city = (TARGET_CITY or "").strip().lower()
+        loc        = (job.get("location") or "").lower()
         desc_start = (job.get("description") or "")[:500].lower()
 
         non_us_countries = (
@@ -701,8 +737,10 @@ def load_seen(sb: Optional[Client]) -> Set[str]:
     if sb:
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            result = sb.table("jobs").select("job_id").gte("last_seen_at", cutoff).execute()
-            return {row["job_id"] for row in (result.data or [])}
+            rows = _select_all(
+                lambda: sb.table("jobs").select("job_id").gte("last_seen_at", cutoff).order("job_id")
+            )
+            return {row["job_id"] for row in rows}
         except Exception as e:
             logger.warning(f"Supabase jobs dedup load failed, falling back to local: {e}")
 
@@ -754,13 +792,10 @@ def load_dead_slugs(sb: Optional[Client]) -> Set[str]:
     if sb:
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            result = (
-                sb.table("dead_slugs")
-                .select("ats, slug")
-                .gte("cached_at", cutoff)
-                .execute()
+            rows = _select_all(
+                lambda: sb.table("dead_slugs").select("ats, slug").gte("cached_at", cutoff).order("ats").order("slug")
             )
-            return {f"{row['ats']}/{row['slug']}" for row in (result.data or [])}
+            return {f"{row['ats']}/{row['slug']}" for row in rows}
         except Exception as e:
             logger.warning(f"Supabase dead_slugs load failed, falling back to local: {e}")
 
@@ -829,18 +864,16 @@ _SCORING_SYSTEM: list = [
             "MANDATORY SCORING RULES — apply these before general fit assessment:\n"
             + SCORING_RULES
             + "\n\n"
-            'Respond ONLY with a JSON object (no markdown, no explanation):\n'
-            '{\n'
-            '  "score": <integer 0-100, after applying all mandatory rules above>,\n'
-            '  "tier": <"A" if score>=80, "B" if 60-79, "C" if 40-59, "skip" if <40>,\n'
-            '  "title_match": <true/false>,\n'
-            '  "location_ok": <true/false>,\n'
-            '  "top_matches": [<3 specific reasons this is a strong match>],\n'
-            '  "gaps": [<up to 3 specific gaps or concerns, referencing mandatory rules where triggered>],\n'
-            '  "apply_urgency": <"high"|"medium"|"low">,\n'
-            '  "one_liner": <one sentence summary of fit, max 20 words>,\n'
-            '  "outreach_angle": <if has_contact true: one sentence on best angle for reaching out, else null>\n'
-            '}\n\n'
+            "Respond with a JSON object containing:\n"
+            "- score: integer 0-100, after applying all mandatory rules above\n"
+            '- tier: "A" if score>=80, "B" if 60-79, "C" if 40-59, "skip" if <40\n'
+            "- title_match, location_ok: true/false\n"
+            "- top_matches: 3 specific reasons this is a strong match\n"
+            "- gaps: up to 3 specific gaps or concerns, referencing mandatory rules where triggered\n"
+            '- apply_urgency: "high", "medium", or "low"\n'
+            "- one_liner: one sentence summary of fit, max 20 words\n"
+            '- team_function: the actual function this role sits in, e.g. "Revenue Operations", "Engineering", "Finance", "Legal"\n'
+            "- outreach_angle: if has_contact is true, one sentence on the best angle for reaching out; otherwise null\n\n"
             "Scoring guide (before mandatory rule adjustments):\n"
             "- 80-100: Strong match on scope, industry, and skills\n"
             "- 60-79: Good match with minor gaps, worth applying\n"
@@ -851,13 +884,39 @@ _SCORING_SYSTEM: list = [
     }
 ]
 
+# Structured output schema — the API guarantees the reply matches this exactly,
+# so there's no markdown stripping or malformed-JSON handling to do.
+_SCORING_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "score":          {"type": "integer"},
+        "tier":           {"type": "string", "enum": ["A", "B", "C", "skip"]},
+        "title_match":    {"type": "boolean"},
+        "location_ok":    {"type": "boolean"},
+        "top_matches":    {"type": "array", "items": {"type": "string"}},
+        "gaps":           {"type": "array", "items": {"type": "string"}},
+        "apply_urgency":  {"type": "string", "enum": ["high", "medium", "low"]},
+        "one_liner":      {"type": "string"},
+        "team_function":  {"type": "string"},
+        "outreach_angle": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": [
+        "score", "tier", "title_match", "location_ok", "top_matches", "gaps",
+        "apply_urgency", "one_liner", "team_function", "outreach_angle",
+    ],
+    "additionalProperties": False,
+}
 
-def score_job(job: dict, contacts: List[dict]) -> dict:
+
+def score_job(job: dict, contacts: List[dict]) -> Optional[dict]:
     """
     Score a job against the candidate profile.
     contacts: all matching rows from the contacts table (may be empty).
     All contact names/roles are included in the user message so Claude can
     personalize outreach_angle and reference specific connections.
+
+    Returns None when scoring fails (API error, bad key, retired model, etc.) —
+    the caller must NOT save or mark the job seen, so it's retried next run.
     """
     global _anthropic_client
     if _anthropic_client is None:
@@ -885,10 +944,14 @@ def score_job(job: dict, contacts: List[dict]) -> dict:
 
     try:
         response = _anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
+            model=CLAUDE_MODEL,
+            max_tokens=8000,   # room for thinking + the JSON reply
             system=_SCORING_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
+            output_config={
+                "effort": CLAUDE_EFFORT,
+                "format": {"type": "json_schema", "schema": _SCORING_SCHEMA},
+            },
         )
         usage = response.usage
         cached  = getattr(usage, "cache_read_input_tokens", 0) or 0
@@ -898,12 +961,24 @@ def score_job(job: dict, contacts: List[dict]) -> dict:
         elif written:
             logger.info(f"  Cache write — {written:,} tokens cached for this run")
 
-        raw = response.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        scoring = json.loads(raw.strip())
+        if response.stop_reason == "refusal":
+            # Claude declined this posting. Record it as skip so it isn't retried
+            # every run — it's a property of the posting, not a system failure.
+            category = getattr(response.stop_details, "category", None) if response.stop_details else None
+            logger.warning(f"  Claude declined to score this posting (category: {category})")
+            return {
+                "score": 0, "tier": "skip", "title_match": False, "location_ok": False,
+                "top_matches": [], "gaps": [f"Claude declined to score ({category})"],
+                "apply_urgency": "low", "one_liner": "Not scored — declined by Claude",
+                "team_function": None, "outreach_angle": None,
+                "has_contact": has_contact, "contact_count": len(contacts),
+            }
+        if response.stop_reason == "max_tokens":
+            logger.error(f"Scoring cut off at max_tokens for '{job.get('title', '?')}'")
+            return None
+
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        scoring = json.loads(text)
         if has_contact:
             scoring["score"] = min(100, scoring["score"] + CONTACT_SCORE_BOOST)
         scoring["has_contact"]   = has_contact
@@ -911,13 +986,7 @@ def score_job(job: dict, contacts: List[dict]) -> dict:
         return scoring
     except Exception as e:
         logger.error(f"Scoring error for '{job.get('title', '?')}': {e}")
-        return {
-            "score": 50, "tier": "B", "title_match": True, "location_ok": True,
-            "top_matches": ["Could not auto-score — review manually"],
-            "gaps": ["Scoring failed"], "apply_urgency": "medium",
-            "one_liner": "Manual review needed",
-            "outreach_angle": None, "has_contact": has_contact, "contact_count": len(contacts),
-        }
+        return None
 
 
 # ─── PUSHOVER ─────────────────────────────────────────────────────────────────
@@ -972,6 +1041,11 @@ def save_scored_job(sb: Optional[Client], job: dict, scoring: dict, pushed_to_no
             "posted_at":        (job.get("posted_at") or "")[:10] or None,
             "pushed_to_notion": pushed_to_notion,
             "last_seen_at":     datetime.now(timezone.utc).isoformat(),
+            "salary_min":       scoring.get("salary_min"),
+            "salary_max":       scoring.get("salary_max"),
+            "salary_mid":       scoring.get("salary_mid"),
+            "team_function":    scoring.get("team_function"),
+            "function_flagged": scoring.get("function_flagged", False),
         }
         sb.table("jobs").upsert(row, on_conflict="job_id").execute()
     except Exception as e:
@@ -1016,6 +1090,7 @@ def push_to_notion(job: dict, scoring: dict) -> bool:
             "https://api.notion.com/v1/pages",
             headers=headers,
             json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties},
+            timeout=20,
         )
         resp.raise_for_status()
         return True
@@ -1131,6 +1206,10 @@ def _poll_one_company(company: dict, seen: Set[str], skippable_dead: Set[str]) -
     return candidates, new_dead
 
 
+class ScoutFailed(Exception):
+    """A problem that should fail the run (and trigger GitHub's failure email)."""
+
+
 def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
     logger.info(f"Job Scout starting — Supabase + parallel polling | dry_run={dry_run} | lookback={hours_back}h")
 
@@ -1140,24 +1219,24 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
     companies = load_companies()
 
     if not companies:
-        logger.error("No companies loaded — check SUPABASE_URL and SUPABASE_KEY")
-        return []
+        raise ScoutFailed("No companies loaded — check SUPABASE_URL and SUPABASE_KEY")
 
     # Load watchlist and contacts index — used at scoring time, not at poll time.
     watchlist               = load_watchlist(sb) if sb else {}
     contact_norm_names, contact_rows = load_contacts_index(sb) if sb else ([], [])
 
-    watch_slugs    = {slug for (slug, ats), w in watchlist.items() if w["priority"] == "watch"}
-    high_slugs     = {slug for (slug, ats), w in watchlist.items() if w["priority"] == "high"}
-    always_surface = watch_slugs | high_slugs
+    # Watchlist entries are keyed by (slug, ats) — the same slug can exist on two platforms.
+    watch_keys     = {key for key, w in watchlist.items() if w["priority"] == "watch"}
+    high_keys      = {key for key, w in watchlist.items() if w["priority"] == "high"}
+    always_surface = watch_keys | high_keys
 
     # Never skip watchlist companies regardless of dead cache.
     # Contact boost is determined at scoring time, not poll time.
-    skippable_dead = {k for k in dead if k.split("/", 1)[-1] not in always_surface}
+    skippable_dead = {k for k in dead if tuple(reversed(k.split("/", 1))) not in always_surface}
 
     logger.info(
         f"Companies: {len(companies)} total | "
-        f"{len(contact_rows)} contacts in index | {len(watch_slugs)} watch | {len(high_slugs)} high | "
+        f"{len(contact_rows)} contacts in index | {len(watch_keys)} watch | {len(high_keys)} high | "
         f"{len(skippable_dead)} cached dead"
     )
 
@@ -1214,7 +1293,7 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
     for job in all_candidates:
         if not passes_hard_filters(job):
             continue
-        is_priority = job.get("company_slug", "") in always_surface
+        is_priority = (job.get("company_slug", ""), job.get("ats", "")) in always_surface
         if not is_priority and not is_within_lookback(job.get("posted_at", ""), hours_back):
             continue
         relevant.append(job)
@@ -1253,11 +1332,13 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
     results:  list      = []
     skipped:  list      = []
     new_seen: List[str] = []
+    scoring_failures     = 0
+    consecutive_failures = 0
 
     for job in relevant:
         company = job.get("company_name", job.get("company_slug", ""))
         logger.info(f"Scoring: {job.get('title', '?')} @ {company}...")
-        slug    = job.get("company_slug", "")
+        company_key = (job.get("company_slug", ""), job.get("ats", ""))
         contacts = find_contacts(
             job.get("company_name", ""), contact_norm_names, contact_rows,
             slug=job.get("company_slug", ""), ats=job.get("ats", ""),
@@ -1265,19 +1346,69 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
         if contacts:
             names = ", ".join(c.get("contact_name") or "?" for c in contacts)
             logger.info(f"  Contact match ({len(contacts)}): {names}")
+
+        # ── Salary pre-gate — runs before Claude to save API cost ─────────────
+        salary_info = parse_salary(job.get("description") or "")
+        _smin = salary_info.get("min")
+        _smax = salary_info.get("max")
+        _smid = ((_smin + _smax) // 2 if _smin is not None and _smax is not None else None)
+
+        if not passes_salary_gate(salary_info):
+            max_comp = _smax or 0
+            logger.info(f"  Salary gate: max ${max_comp:,} < ${SALARY_FLOOR_BASE:,} floor — skipping")
+            gate_scoring = {
+                "score": 0, "tier": "skip", "title_match": True, "location_ok": True,
+                "top_matches": [], "apply_urgency": "low",
+                "gaps": [f"salary gate: stated max ${max_comp:,} below ${SALARY_FLOOR_BASE:,} floor"],
+                "one_liner": "Salary gate: below floor",
+                "team_function": None, "outreach_angle": None,
+                "has_contact": len(contacts) > 0, "contact_count": len(contacts),
+                "salary_min": _smin, "salary_max": _smax, "salary_mid": _smid,
+                "function_flagged": False,
+            }
+            save_scored_job(sb, job, gate_scoring, pushed_to_notion=False)
+            new_seen.append(job["id"])
+            continue
+
         scoring = score_job(job, contacts)
+        if scoring is None:
+            # Not saved and not marked seen, so it's retried on the next run.
+            scoring_failures     += 1
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_SCORING_FAILURES:
+                logger.error(
+                    f"{consecutive_failures} scoring failures in a row — stopping. "
+                    f"Check ANTHROPIC_API_KEY, account credits, and CLAUDE_MODEL ('{CLAUDE_MODEL}')."
+                )
+                break
+            continue
+        consecutive_failures = 0
+
+        # Attach salary data so save_scored_job can persist it
+        scoring["salary_min"] = _smin
+        scoring["salary_max"] = _smax
+        scoring["salary_mid"] = _smid
 
         # Apply watchlist priority boosts (on top of any contact boost from score_job)
-        if slug in high_slugs:
+        if company_key in high_keys:
             scoring["score"] = min(100, scoring["score"] + HIGH_SCORE_BOOST)
-        elif slug in watch_slugs:
+        elif company_key in watch_keys:
             scoring["score"] = min(100, scoring["score"] + WATCH_SCORE_BOOST)
 
         # Recalculate tier after boosts
         s = scoring["score"]
         scoring["tier"] = "A" if s >= 80 else "B" if s >= 60 else "C" if s >= 40 else "skip"
 
-        is_priority = slug in always_surface
+        # ── Function flag — soft signal, not a hard gate (yet) ────────────────
+        # Logs and records which jobs WOULD have been dropped by function gate.
+        # Review jobs table (function_flagged = TRUE) after one week, then decide
+        # whether to enable as a hard gate.
+        gate_reason = function_gate_reason(scoring)
+        if gate_reason:
+            logger.info(f"  Function flag: {gate_reason}")
+        scoring["function_flagged"] = gate_reason is not None
+
+        is_priority = company_key in always_surface
         if scoring["score"] < SCORE_THRESHOLD and not is_priority:
             logger.info(f"  Score {scoring['score']} below threshold — skipping")
             save_scored_job(sb, job, scoring, pushed_to_notion=False)
@@ -1329,6 +1460,10 @@ def run_scout(dry_run: bool = False, hours_back: int = HOURS_LOOKBACK) -> list:
 
     save_seen(sb, new_seen)
     logger.info(f"Done. {len(results)} jobs pushed above threshold | {len(no_desc)} need manual description review.")
+    if scoring_failures:
+        raise ScoutFailed(
+            f"{scoring_failures} job(s) could not be scored — they'll be retried next run. See errors above."
+        )
     return results
 
 
@@ -1342,7 +1477,12 @@ def main():
                         help=f"Only process jobs posted in the last N hours (default {HOURS_LOOKBACK}). "
                              "Use a large value (e.g. 168) on first run to backfill.")
     args = parser.parse_args()
-    run_scout(dry_run=args.dry_run, hours_back=args.hours)
+    try:
+        run_scout(dry_run=args.dry_run, hours_back=args.hours)
+    except ScoutFailed as e:
+        # Non-zero exit marks the GitHub Actions run as failed, which emails you.
+        logger.error(f"Run failed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

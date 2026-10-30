@@ -3,8 +3,10 @@
 # 1. Copy this file to config.py and fill in your settings.
 # 2. Copy profile.example.md to profile.md and fill in your resume/targets.
 #
-# config.py and profile.md are gitignored — your personal info stays in your
-# private fork and never appears in the template repo.
+# Following SETUP.md? You create config.py in your PRIVATE repo on GitHub and
+# commit it there (GitHub Actions needs it to run). It holds search settings
+# only — never put API keys in it; those go in GitHub Secrets. Your profile goes
+# in the CANDIDATE_PROFILE secret, not in a file.
 #
 # ─── HOW FILTERING WORKS (read this first) ────────────────────────────────────
 #
@@ -38,6 +40,14 @@ HIGH_SCORE_BOOST    = 10   # bonus for priority='high' companies
 CONTACT_SCORE_BOOST = 10   # bonus when you have a contact at the company
                            # (only matters once you've imported LinkedIn contacts;
                            #  harmless to leave at 10 — or set to 0 — until then)
+
+# ─── CLAUDE MODEL (optional) ──────────────────────────────────────────────────
+#
+# Which Claude model scores your jobs, and how hard it thinks. The defaults are a
+# good balance of quality and cost — you can leave these alone.
+#   CLAUDE_EFFORT: "low" (cheapest, fine for most), "medium", or "high"
+CLAUDE_MODEL  = "claude-sonnet-5-5"
+CLAUDE_EFFORT = "low"
 
 # ─── TITLE FILTER: ROLE TITLES + KEYWORDS ─────────────────────────────────────
 #
@@ -106,6 +116,19 @@ HARD_FILTERS = {
     # entirely and accept jobs anywhere.
     "require_remote_or_city": True,
 }
+
+# ─── OPTIONAL GATES ───────────────────────────────────────────────────────────
+#
+# SALARY_FLOOR_BASE: if a posting states a base salary whose TOP is below this,
+# it's dropped before Claude ever sees it (saves API cost). Postings with no
+# salary always pass. 0 = off. Example: 90_000
+SALARY_FLOOR_BASE = 0
+
+# DISQUALIFY_FUNCTIONS: Claude labels each job's real function (e.g. "Finance").
+# Jobs whose label contains any of these words are flagged in Supabase
+# (jobs.function_flagged) so you can spot mis-titled roles. Flag only — nothing
+# is dropped. Example: ["engineering", "finance", "legal", "recruiting"]
+DISQUALIFY_FUNCTIONS = []
 
 # ─── SCORING RULES ────────────────────────────────────────────────────────────
 #

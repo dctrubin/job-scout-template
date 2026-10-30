@@ -87,7 +87,9 @@ You'll run one SQL script that creates all the tables Job Scout needs. You do th
 > - `companies` table (populated by the seed step) + `jobs` table + `dead_slugs` cache + analytics views
 > - `company_watchlist` table (for VIP companies you want to prioritize) + `contacts` table (starts empty — LinkedIn contacts are an advanced feature not covered in this guide)
 >
-> It also includes the permission grants the Job Scout code needs. Safe to run more than once — it won't overwrite existing data.
+> It also includes the permission grants the Job Scout code needs, and locks the tables down (Row Level Security) so nobody but your own Job Scout can read them. Safe to run more than once — it won't overwrite existing data.
+>
+> Afterwards you can confirm the lockdown: **Advisors → Security Advisor** in the left sidebar should show no errors for these tables.
 
 ### 2c. Get your Supabase credentials
 
@@ -96,7 +98,7 @@ You need two values from Supabase — save both for Step 7.
 **SUPABASE_URL:**
 
 Look at your browser's URL bar while you're in your Supabase project. It will show something like:
-`https://app.supabase.com/project/abcdefghijkl`
+`https://supabase.com/dashboard/project/abcdefghijkl`
 
 Your SUPABASE_URL is that project ID turned into a hostname:
 `https://abcdefghijkl.supabase.co`
@@ -303,9 +305,11 @@ This loads ~26,000 companies into your Supabase database. You only ever need to 
 4. The workflow will appear in the list — click it to watch progress
 5. Wait for it to finish with a green checkmark (takes 5–10 minutes)
 
-**What you should see in the logs:** Lines like `Greenhouse: 8234 companies upserted`, `BambooHR: 10821 companies upserted`, etc.
+**What you should see in the logs:** a line per platform with how many company slugs it found, then `=== Done: N inserted/skipped, 0 failed ===`.
 
 If it fails, check that `SUPABASE_URL` and `SUPABASE_KEY` are added correctly in Step 7.
+
+After this first run, the seed also runs automatically on the 1st of every month to pick up newly listed companies. It only adds companies — nothing you've set up is overwritten.
 
 ---
 
@@ -326,7 +330,7 @@ The automation runs automatically at ~4:45am and ~3:52pm Central Time every day.
 - If any jobs scored 80+ and you set up Pushover, you'll get a phone notification
 
 **If nothing appears in Notion after a successful run:**
-Nothing is passing the title filter, or everything scored below your threshold. Check the run logs for `[TITLE MATCH]` lines — if you see none, broaden your `ROLE_TITLES` or `_TITLE_TERMS`/`_TITLE_QUALIFIERS` for your field (see Step 6). See Troubleshooting for more.
+Nothing is passing the title filter, or everything scored below your threshold. In the run log, find the line `Relevant new jobs after filtering: N`. If N is 0, nothing passed your title filter — broaden your `ROLE_TITLES` or `_TITLE_TERMS`/`_TITLE_QUALIFIERS` for your field (see Step 6). If N is above 0, look at the `Scoring: <title> @ <company>` lines and the `Score NN below threshold` lines after them. See Troubleshooting for more.
 
 ---
 
@@ -406,7 +410,9 @@ The score boosts (`WATCH_SCORE_BOOST` and `HIGH_SCORE_BOOST`) are already set in
 
 **"Supabase error" or similar database error** → Double-check `SUPABASE_URL` and `SUPABASE_KEY`. Make sure you used the `service_role` key, not `anon`.
 
-**No jobs appear in Notion after a successful run** → Check the run logs for `[TITLE MATCH]` lines. If you see none, nothing is passing the title filter — your `ROLE_TITLES` and your `_TITLE_TERMS`/`_TITLE_QUALIFIERS` sets aren't matching any job titles. Add more general titles, broaden the keyword sets to your field, or check for typos. If you *do* see matches but nothing reached Notion, they all scored below `SCORE_THRESHOLD`.
+**No jobs appear in Notion after a successful run** → In the run log, find `Relevant new jobs after filtering: N`. If N is 0, nothing is passing the title filter — your `ROLE_TITLES` and your `_TITLE_TERMS`/`_TITLE_QUALIFIERS` sets aren't matching any job titles. Add more general titles, broaden the keyword sets to your field, or check for typos. If N is above 0 but nothing reached Notion, look for `Score NN below threshold` lines — they all scored below `SCORE_THRESHOLD`.
+
+**Run fails with "could not be scored" or "scoring failures in a row"** → Claude couldn't score jobs. The error lines just above say why: `401`/`authentication` = the `ANTHROPIC_API_KEY` secret is wrong; `credit balance` = add credits in the Anthropic console; `404`/`not_found` = the model in `CLAUDE_MODEL` (config.py) has been retired — update it. Nothing is lost: unscored jobs are retried on the next run.
 
 **My feed is full of jobs from the wrong field** → You updated `profile.md` but left the title keywords on the defaults. The `_TITLE_TERMS`/`_TITLE_QUALIFIERS` sets in `config.py` ship tuned for revenue/sales operations; edit them to match your field (or set one to `set()` to disable that path). See Step 6.
 
@@ -414,4 +420,26 @@ The score boosts (`WATCH_SCORE_BOOST` and `HIGH_SCORE_BOOST`) are already set in
 
 **Seed step failed partway through** → Safe to re-run — the seed script uses upserts and won't create duplicates. Just trigger the Seed Companies workflow again.
 
+**GitHub emailed me that a run failed** → That's on purpose: the run is marked failed whenever something needs your attention (bad key, Supabase unreachable, jobs that couldn't be scored). Open the run in the Actions tab and read the last few lines of the log.
+
 **Jobs are repeating every run** → This usually means the Supabase connection isn't working and the dedup cache isn't being saved. Check your Supabase credentials.
+
+---
+
+## Updating an existing setup
+
+Set up Job Scout before November 2026? To pick up the latest fixes (Claude Sonnet 5.5, database lockdown, failed runs that email you, monthly company refresh):
+
+1. In your repo, replace these files with the versions from the template: `job_scout.py`, `salary.py`, `gates.py`, `seed_companies.py`, `requirements.txt`, and both files in `.github/workflows/`. (Open each file in the template → **Copy raw file** → paste over yours → **Commit changes**.)
+2. Re-run `supabase_setup.sql` in the Supabase SQL editor (Step 2b). It's safe on an existing database — it adds the new columns and the lockdown without touching your data.
+3. Your `config.py` keeps working as-is. Optionally copy the new **CLAUDE MODEL** and **OPTIONAL GATES** sections from `config.example.py` into it.
+4. Run **Job Scout** once from the Actions tab to confirm it finishes with a green check.
+
+---
+
+## Keeping your setup secure
+
+- Keep your copy of the repo **private**. Your `config.py` and run logs describe your job search.
+- Never paste API keys into any file. They belong only in GitHub Secrets (Step 7).
+- Turn on two-factor authentication for GitHub, Supabase, Anthropic, and Notion. Those accounts hold your keys.
+- If a key ever leaks (pasted somewhere public, shared in a screenshot), revoke it on that service, create a new one, and update the GitHub secret.
